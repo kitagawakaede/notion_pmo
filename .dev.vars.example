@@ -1,0 +1,31 @@
+# Sample local dev vars (non-secret). Do NOT commit real secrets.
+
+OPENAI_MODEL="gpt-4.1-mini"
+
+# Notion target DBs (one of URL or name required)
+SPRINT_DB_URL=""
+SPRINT_DB_NAME=""
+
+# MCP (self-hosted) settings
+MCP_SERVER_URL=""
+MCP_AUTH_TOKEN=""
+
+# Allowed DB whitelist (JSON or CSV). Empty = no whitelist.
+ALLOWED_DB_URLS=""
+# Allow all properties from allowed DBs; otherwise only NOTIFY_PROPERTIES
+ALLOW_ALL_PROPERTIES="false"
+
+# Direct Notion API (non-MCP)
+NOTION_DATABASE_ID=""
+NOTION_DATE_PROPERTY="期間"
+
+# Notification properties (JSON or CSV)
+NOTIFY_PROPERTIES="[\"確定 見積SP\",\"確定 実績SP\",\"確定 想定\"]"
+
+# Slack webhooks
+SLACK_WEBHOOK_URL=""
+SLACK_ERROR_WEBHOOK_URL=""
+
+# Others
+DRY_RUN="true"
+REQUIRE_APPROVAL="never"

@@ -1,0 +1,33 @@
+name = "notion-sprint-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Cron Triggers (UTC). Example: 00:00 UTC = 09:00 JST.
+# デフォルト: 本番と同じ設定を想定。env.* セクションで上書き可。
+triggers = { crons = ["0 0 * * *"] }
+
+[observability]
+enabled = true
+
+# Replace with your KV namespace IDs.
+[[kv_namespaces]]
+binding = "NOTIFY_CACHE"
+id = "2185f8f0b58142d7a7f7c3fc5e29447f"
+preview_id = "2185f8f0b58142d7a7f7c3fc5e29447f"
+
+[vars]
+OPENAI_MODEL = "gpt-4.1-mini"
+NOTIFY_PROPERTIES = "[\"確定 見積SP\",\"確定 実績SP\",\"確定 想定\"]"
+
+# --- dev 環境用の上書き例（任意） ---
+[env.dev]
+name = "notion-sprint-worker-dev"
+triggers = { crons = ["0 23 * * *"] } # 08:00 JST 相当
+[[env.dev.kv_namespaces]]
+binding = "NOTIFY_CACHE"
+id = "2185f8f0b58142d7a7f7c3fc5e29447f"
+preview_id = "2185f8f0b58142d7a7f7c3fc5e29447f"
+
+[env.dev.vars]
+OPENAI_MODEL = "gpt-4.1-mini"
+NOTIFY_PROPERTIES = "[\"確定 見積SP\",\"確定 実績SP\",\"確定 想定\"]"

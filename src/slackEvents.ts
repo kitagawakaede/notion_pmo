@@ -17,9 +17,11 @@ import {
   savePendingCreateRef,
   getPendingCreateRef,
   deletePendingCreateRef,
-  toJstDateString
+  toJstDateString,
+  savePhoneReminder,
+  deletePhoneReminder
 } from "./workflow";
-import { chatPostMessage, conversationsHistory, conversationsReplies } from "./slackBot";
+import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen } from "./slackBot";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
 import { updateTaskPage, updateTaskSprint, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
 import { fetchCurrentSprintTasksSummary, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems } from "./notionApi";
@@ -969,6 +971,107 @@ async function handleMention(
   }
 }
 
+// ── Handle ☎️ phone reaction → send thread content as DM ────────────────
+
+const PHONE_REACTIONS = ["phone", "telephone_receiver"];
+
+async function handlePhoneReaction(
+  env: Bindings,
+  event: Record<string, unknown>
+): Promise<void> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return;
+
+  const userId = event.user as string;
+  const item = event.item as Record<string, unknown>;
+  const channel = item.channel as string;
+  const messageTs = item.ts as string;
+
+  console.log(`handlePhoneReaction: user=${userId}, channel=${channel}, messageTs=${messageTs}`);
+
+  // Fetch thread content (treat messageTs as thread parent)
+  const messages = await conversationsReplies(
+    config.slackBotToken,
+    channel,
+    messageTs,
+    100,
+    true // include parent
+  );
+
+  if (messages.length === 0) return;
+
+  // Format thread content for DM
+  const threadContent = messages
+    .map((m) => `<@${m.user}>: ${m.text}`)
+    .join("\n\n");
+
+  // Build permalink
+  const threadLink = `https://slack.com/archives/${channel}/p${messageTs.replace(".", "")}`;
+
+  const dmText =
+    `☎️ *リマインド設定されたスレッド*\n` +
+    `<${threadLink}|スレッドを見る>\n\n` +
+    `───────────────\n` +
+    `${threadContent}\n` +
+    `───────────────\n` +
+    `_1時間ごとにリマインドします。解除するには ☎️ リアクションを外してください。_`;
+
+  // Open DM channel with user
+  const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
+  if (!dmChannelId) {
+    console.error(`Failed to open DM channel for user ${userId}`);
+    return;
+  }
+
+  // Send initial DM
+  await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
+
+  // Save reminder to KV
+  const now = new Date().toISOString();
+  await savePhoneReminder(env.NOTIFY_CACHE, userId, channel, messageTs, {
+    userId,
+    channel,
+    threadTs: messageTs,
+    createdAt: now,
+    lastRemindedAt: now
+  });
+
+  console.log(`Phone reminder saved: user=${userId}, channel=${channel}, threadTs=${messageTs}`);
+}
+
+// ── Handle reaction_removed (cancel ☎️ reminder) ────────────────────────
+
+async function handleReactionRemoved(
+  env: Bindings,
+  event: Record<string, unknown>
+): Promise<void> {
+  const reaction = event.reaction as string;
+  if (!PHONE_REACTIONS.includes(reaction)) return;
+
+  const userId = event.user as string;
+  const item = event.item as Record<string, unknown> | undefined;
+  if (!item || item.type !== "message") return;
+
+  const channel = item.channel as string;
+  const messageTs = item.ts as string;
+
+  await deletePhoneReminder(env.NOTIFY_CACHE, userId, channel, messageTs);
+  console.log(`Phone reminder removed: user=${userId}, channel=${channel}, threadTs=${messageTs}`);
+
+  // Notify user that reminder was cancelled
+  const config = getConfig(env);
+  if (config.slackBotToken) {
+    const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
+    if (dmChannelId) {
+      await chatPostMessage(
+        config.slackBotToken,
+        dmChannelId,
+        "☎️ リマインドを解除しました。"
+      );
+    }
+  }
+}
+
 // ── Handle ✅ reaction (reaction_added event) ──────────────────────────────
 
 async function handleReactionAdded(
@@ -979,8 +1082,6 @@ async function handleReactionAdded(
   if (!config.slackBotToken) return;
 
   const reaction = event.reaction as string;
-  // Only handle ✅ (white_check_mark)
-  if (reaction !== "white_check_mark") return;
 
   const item = event.item as Record<string, unknown> | undefined;
   if (!item || item.type !== "message") return;
@@ -989,6 +1090,15 @@ async function handleReactionAdded(
   const messageTs = item.ts as string;
 
   console.log(`handleReactionAdded: reaction=${reaction}, channel=${channel}, messageTs=${messageTs}`);
+
+  // ── ☎️ phone reaction → thread reminder DM ─────────────────────────────
+  if (PHONE_REACTIONS.includes(reaction)) {
+    await handlePhoneReaction(env, event);
+    return;
+  }
+
+  // Only handle ✅ (white_check_mark) below
+  if (reaction !== "white_check_mark") return;
 
   // Check if there's a pending Notion action for this message
   const pending = await getPendingAction(env.NOTIFY_CACHE, channel, messageTs);
@@ -1389,6 +1499,12 @@ export async function handleSlackEvents(
   // ── reaction_added ──────────────────────────────────────────────────────
   if (eventType === "reaction_added") {
     await bg(handleReactionAdded(env, event));
+    return new Response("ok");
+  }
+
+  // ── reaction_removed (cancel ☎️ reminder) ──────────────────────────────
+  if (eventType === "reaction_removed") {
+    await bg(handleReactionRemoved(env, event));
     return new Response("ok");
   }
 

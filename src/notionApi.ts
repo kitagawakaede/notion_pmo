@@ -312,6 +312,7 @@ interface TaskRow {
   company: string | null;
   url?: string | null;
   assignees: string[];
+  projectIds: string[];
 }
 
 const extractSprintInfo = (
@@ -356,6 +357,77 @@ const extractSprintInfo = (
     requiredSpPerDay
   };
 };
+
+/** Fetch page titles by IDs in batch (individual fetches, deduplicated) */
+async function fetchPageTitles(
+  config: AppConfig,
+  pageIds: string[]
+): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const unique = [...new Set(pageIds)];
+
+  await Promise.all(
+    unique.map(async (pageId) => {
+      try {
+        const res = await withRetry(
+          async () => {
+            const r = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+              headers: {
+                Authorization: `Bearer ${config.notionToken}`,
+                "Notion-Version": NOTION_VERSION
+              }
+            });
+            if (!r.ok) throw new Error(`${r.status}`);
+            return r.json();
+          },
+          { label: `fetchPage ${pageId}` }
+        );
+        const props = (res as any)?.properties ?? {};
+        for (const prop of Object.values(props)) {
+          if ((prop as any)?.type === "title" && Array.isArray((prop as any).title)) {
+            const title = (prop as any).title
+              .map((t: any) => t.plain_text ?? "")
+              .join("");
+            if (title) {
+              result.set(pageId, title);
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`Failed to fetch page title for ${pageId}: ${(err as Error).message}`);
+      }
+    })
+  );
+
+  return result;
+}
+
+/** Generate abbreviated project name (e.g. "Mavericks" → "M", "LiftForce" → "LF") */
+function abbreviateProjectName(name: string): string {
+  // If already short (<=3 chars), use as-is
+  if (name.length <= 3) return name;
+
+  // Extract uppercase letters from camelCase/PascalCase (e.g. "LiftForce" → "LF")
+  const uppercaseLetters = name.match(/[A-Z]/g);
+  if (uppercaseLetters && uppercaseLetters.length >= 2) {
+    return uppercaseLetters.join("");
+  }
+
+  // Split by spaces/delimiters and take initials
+  const words = name.split(/[\s\-_・]+/).filter(Boolean);
+  if (words.length >= 2) {
+    return words.map((w) => w[0].toUpperCase()).join("");
+  }
+
+  // Single word: first 1-2 chars (uppercase for English)
+  if (/^[a-zA-Z]/.test(name)) {
+    return name.slice(0, 1).toUpperCase();
+  }
+
+  // Japanese/other: first char
+  return name.slice(0, 1);
+}
 
 const extractTaskRow = (page: any): TaskRow | null => {
   const props = page?.properties ?? {};
@@ -404,6 +476,15 @@ const extractTaskRow = (page: any): TaskRow | null => {
   const startDateValue = getDateValue(startDateProp);
   const startDate = normalizeDateString(startDateValue?.start) ?? null;
 
+  // Extract per-task project relation IDs
+  const projectProp = getPropertyByName(props, ["プロジェクト", "Project"]);
+  const taskProjectIds: string[] = [];
+  if (projectProp?.type === "relation" && Array.isArray(projectProp.relation)) {
+    for (const rel of projectProp.relation) {
+      if (rel?.id) taskProjectIds.push(rel.id);
+    }
+  }
+
   return {
     id: page.id,
     name,
@@ -416,7 +497,8 @@ const extractTaskRow = (page: any): TaskRow | null => {
     subItem,
     company,
     url,
-    assignees
+    assignees,
+    projectIds: taskProjectIds
   };
 };
 
@@ -469,7 +551,8 @@ const groupTasksByAssignee = (
         category: task.category ?? null,
         subItem: task.subItem ?? null,
         company: task.company ?? null,
-        url: task.url ?? null
+        url: task.url ?? null,
+        projectName: null as string | null
       }))
     };
   });
@@ -561,6 +644,35 @@ export async function fetchCurrentSprintTasksSummary(
     console.warn("No project relations found in sprint tasks");
   }
 
+  // Resolve project IDs to names and assign to tasks
+  const allTaskProjectIds = tasks.flatMap((t) => t.projectIds);
+  const uniqueProjectIds = [...new Set(allTaskProjectIds)];
+  let projectNameMap = new Map<string, string>();
+  if (uniqueProjectIds.length > 0) {
+    projectNameMap = await fetchPageTitles(config, uniqueProjectIds);
+    console.log(`Project names resolved: ${Array.from(projectNameMap.entries()).map(([id, name]) => `${name}(${id.slice(0, 8)})`).join(", ")}`);
+  }
+
+  // Build task ID → project name mapping
+  const taskProjectNameMap = new Map<string, string>();
+  for (const task of tasks) {
+    if (task.projectIds.length > 0) {
+      const firstName = projectNameMap.get(task.projectIds[0]);
+      if (firstName) {
+        taskProjectNameMap.set(task.id, firstName);
+      }
+    }
+  }
+
+  const assignees = groupTasksByAssignee(tasks);
+
+  // Assign project names to grouped tasks
+  for (const assignee of assignees) {
+    for (const task of assignee.tasks) {
+      task.projectName = taskProjectNameMap.get(task.id) ?? null;
+    }
+  }
+
   return {
     sprint: {
       id: sprint.id,
@@ -574,7 +686,7 @@ export async function fetchCurrentSprintTasksSummary(
       progress_sp: sprint.progressSp,
       required_sp_per_day: sprint.requiredSpPerDay
     },
-    assignees: groupTasksByAssignee(tasks),
+    assignees,
     projectIds
   };
 }

@@ -1017,34 +1017,49 @@ async function runEveningFlow(
       avgDailySp = calcAvgDailySpFromSprint(summary, today);
     }
 
-    // Calculate yesterday's completed SP (tasks that moved to completed status)
+    // Calculate yesterday's consumed SP from 5AM progress_sp snapshots
+    // (前日AM5時→当日AM5時の進捗SPの差)
     const yesterdayKey = toJstDateString(now, -1);
-    const yesterdaySnapshotRaw = await env.NOTIFY_CACHE.get(
-      `sprint-task-snapshot:${summary.sprint.id}:${yesterdayKey}`,
+    const todayProgressSpRaw = await env.NOTIFY_CACHE.get(
+      `progress-sp-5am:${summary.sprint.id}:${today}`,
       "json"
-    ) as Array<{ id: string; name: string; status: string | null; sp: number | null }> | null;
+    ) as { progress_sp: number | null } | null;
+    const yesterdayProgressSpRaw = await env.NOTIFY_CACHE.get(
+      `progress-sp-5am:${summary.sprint.id}:${yesterdayKey}`,
+      "json"
+    ) as { progress_sp: number | null } | null;
 
     let yesterdayCompletedSp = 0;
-    if (yesterdaySnapshotRaw) {
-      const prevById = new Map(yesterdaySnapshotRaw.map((t) => [t.id, t]));
-      const currentSnapshot = summary.assignees.flatMap((a) =>
-        a.tasks.map((t) => ({ id: t.id, status: t.status ?? null, sp: t.sp ?? null }))
-      );
-      for (const task of currentSnapshot) {
-        const prev = prevById.get(task.id);
-        if (!prev) continue;
-        if (isCompletedStatus(task.status) && !isCompletedStatus(prev.status)) {
-          yesterdayCompletedSp += task.sp ?? 0;
+    if (todayProgressSpRaw?.progress_sp != null && yesterdayProgressSpRaw?.progress_sp != null) {
+      yesterdayCompletedSp = todayProgressSpRaw.progress_sp - yesterdayProgressSpRaw.progress_sp;
+      console.log(`Yesterday consumed SP (5AM snapshots): ${yesterdayCompletedSp} (${yesterdayProgressSpRaw.progress_sp} → ${todayProgressSpRaw.progress_sp})`);
+    } else {
+      // Fallback: task status change method
+      const yesterdaySnapshotRaw = await env.NOTIFY_CACHE.get(
+        `sprint-task-snapshot:${summary.sprint.id}:${yesterdayKey}`,
+        "json"
+      ) as Array<{ id: string; name: string; status: string | null; sp: number | null }> | null;
+
+      if (yesterdaySnapshotRaw) {
+        const prevById = new Map(yesterdaySnapshotRaw.map((t) => [t.id, t]));
+        const currentSnapshot = summary.assignees.flatMap((a) =>
+          a.tasks.map((t) => ({ id: t.id, status: t.status ?? null, sp: t.sp ?? null }))
+        );
+        for (const task of currentSnapshot) {
+          const prev = prevById.get(task.id);
+          if (!prev) continue;
+          if (isCompletedStatus(task.status) && !isCompletedStatus(prev.status)) {
+            yesterdayCompletedSp += task.sp ?? 0;
+          }
+        }
+        const currentIds = new Set(currentSnapshot.map((t) => t.id));
+        for (const prev of yesterdaySnapshotRaw) {
+          if (!currentIds.has(prev.id) && !isCompletedStatus(prev.status)) {
+            yesterdayCompletedSp += prev.sp ?? 0;
+          }
         }
       }
-      // Also count tasks in yesterday's snapshot that are no longer in current (removed = completed)
-      const currentIds = new Set(currentSnapshot.map((t) => t.id));
-      for (const prev of yesterdaySnapshotRaw) {
-        if (!currentIds.has(prev.id) && !isCompletedStatus(prev.status)) {
-          yesterdayCompletedSp += prev.sp ?? 0;
-        }
-      }
-      console.log(`Yesterday completed SP: ${yesterdayCompletedSp}`);
+      console.log(`Yesterday completed SP (fallback): ${yesterdayCompletedSp}`);
     }
 
     // Step 2-A: Detect stagnant Doing tasks
@@ -1210,6 +1225,37 @@ async function notifyError(_env: Env, config: AppConfig, error: Error) {
     await postSlack(config.slackErrorWebhookUrl, message);
   } catch (err) {
     console.error("Failed to send error notification", err);
+  }
+}
+
+// ── Progress SP Snapshot (05:00 JST = 20:00 UTC) ─────────────────────────
+
+/** Save sprint progress_sp snapshot at 5AM JST for daily consumption calculation */
+async function runProgressSpSnapshot(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  let config: AppConfig | undefined;
+  try {
+    config = getConfig(env);
+    const now = new Date();
+    const today = toJstDateString(now);
+    const summary = await fetchCurrentSprintTasksSummary(config, now);
+
+    const progressSp = summary.sprint_metrics?.progress_sp ?? null;
+    const snapshotKey = `progress-sp-5am:${summary.sprint.id}:${today}`;
+
+    await env.NOTIFY_CACHE.put(snapshotKey, JSON.stringify({
+      progress_sp: progressSp,
+      timestamp: now.toISOString()
+    }), { expirationTtl: config.dedupeTtlSeconds });
+
+    console.log(`Progress SP snapshot saved: ${snapshotKey} = ${progressSp}`);
+    return { ok: true, reason, progressSp, date: today };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runProgressSpSnapshot failed", err);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -1421,6 +1467,11 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
+  if (path === "/pmo/progress-snapshot") {
+    const result = await runProgressSpSnapshot(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
   if (path === "/query" && request.method === "POST") {
     let body: Record<string, unknown>;
     try {
@@ -1556,7 +1607,10 @@ export default {
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     // Branch by cron expression
-    if (event.cron === "0 0 * * *") {
+    if (event.cron === "0 20 * * *") {
+      // 05:00 JST — Save progress SP snapshot
+      ctx.waitUntil(runProgressSpSnapshot(env, "cron"));
+    } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
       ctx.waitUntil(runMorningFlow(env, "cron"));
     } else if (event.cron === "10,20,30,40,50 0 * * *") {

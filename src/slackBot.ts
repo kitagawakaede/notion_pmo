@@ -130,6 +130,16 @@ export async function conversationsReplies(
     }));
 }
 
+export async function conversationsOpen(
+  token: string,
+  userId: string
+): Promise<string> {
+  const data = (await slackApiCall(token, "conversations.open", {
+    users: userId
+  })) as { channel?: { id?: string } };
+  return data.channel?.id ?? "";
+}
+
 export async function chatPostMessage(
   token: string,
   channel: string,

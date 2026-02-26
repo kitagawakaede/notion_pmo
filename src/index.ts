@@ -28,7 +28,7 @@ import {
   interpretRepliesAndPropose,
   matchTasksToSchedule
 } from "./llmAnalyzer";
-import { chatPostMessage } from "./slackBot";
+import { chatPostMessage, conversationsReplies, conversationsOpen } from "./slackBot";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -37,7 +37,9 @@ import {
   addActiveThread,
   getActiveThreads,
   getReplies,
-  toJstDateString
+  toJstDateString,
+  listAllPhoneReminders,
+  savePhoneReminder
 } from "./workflow";
 
 interface Env extends Bindings {}
@@ -1158,6 +1160,83 @@ async function notifyError(_env: Env, config: AppConfig, error: Error) {
   }
 }
 
+// ── Phone Reminder Flow (☎️ hourly DM reminders) ──────────────────────────
+
+async function runPhoneReminderFlow(
+  env: Env,
+  trigger: "cron" | "manual"
+): Promise<{ ok: boolean; message: string }> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) {
+    return { ok: false, message: "SLACK_BOT_TOKEN not configured" };
+  }
+
+  const reminders = await listAllPhoneReminders(env.NOTIFY_CACHE);
+  if (reminders.length === 0) {
+    console.log(`runPhoneReminderFlow(${trigger}): no active reminders`);
+    return { ok: true, message: "No active phone reminders" };
+  }
+
+  const now = new Date();
+  let sentCount = 0;
+
+  for (const reminder of reminders) {
+    // Check if 1 hour has passed since last reminder
+    const lastReminded = new Date(reminder.lastRemindedAt);
+    const msSinceLastRemind = now.getTime() - lastReminded.getTime();
+    if (msSinceLastRemind < 60 * 60 * 1000) continue;
+
+    try {
+      // Fetch latest thread content
+      const messages = await conversationsReplies(
+        config.slackBotToken,
+        reminder.channel,
+        reminder.threadTs,
+        100,
+        true
+      );
+
+      if (messages.length === 0) continue;
+
+      const threadContent = messages
+        .map((m) => `<@${m.user}>: ${m.text}`)
+        .join("\n\n");
+
+      const threadLink = `https://slack.com/archives/${reminder.channel}/p${reminder.threadTs.replace(".", "")}`;
+
+      const dmText =
+        `☎️ *スレッドリマインド*\n` +
+        `<${threadLink}|スレッドを見る>\n\n` +
+        `───────────────\n` +
+        `${threadContent}\n` +
+        `───────────────\n` +
+        `_☎️ リアクションを外すとリマインドを解除できます。_`;
+
+      const dmChannelId = await conversationsOpen(config.slackBotToken, reminder.userId);
+      if (!dmChannelId) continue;
+
+      await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
+
+      // Update lastRemindedAt
+      await savePhoneReminder(
+        env.NOTIFY_CACHE,
+        reminder.userId,
+        reminder.channel,
+        reminder.threadTs,
+        { ...reminder, lastRemindedAt: now.toISOString() }
+      );
+
+      sentCount++;
+    } catch (err) {
+      console.error(`Phone reminder failed for user=${reminder.userId} thread=${reminder.threadTs}:`, err);
+    }
+  }
+
+  const msg = `Sent ${sentCount} phone reminders out of ${reminders.length} active (trigger=${trigger})`;
+  console.log(`runPhoneReminderFlow: ${msg}`);
+  return { ok: true, message: msg };
+}
+
 // ── HTTP handler ───────────────────────────────────────────────────────────
 
 async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
@@ -1228,6 +1307,11 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
 
   if (path === "/pmo/pm-reminder") {
     const result = await runPmReminderFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  if (path === "/pmo/phone-reminder") {
+    const result = await runPhoneReminderFlow(env, "manual");
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
@@ -1378,6 +1462,9 @@ export default {
     } else if (event.cron === "0 2-10 * * *") {
       // 11:00-19:00 JST (hourly) — PM reminder if unreplied
       ctx.waitUntil(runPmReminderFlow(env, "cron"));
+    } else if (event.cron === "15 * * * *") {
+      // Every hour at :15 — ☎️ Phone reminder DMs
+      ctx.waitUntil(runPhoneReminderFlow(env, "cron"));
     } else {
       // Fallback: legacy reports
       ctx.waitUntil(runReport(env, "cron"));

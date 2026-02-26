@@ -232,7 +232,7 @@ export function buildAssigneeTasksPayload(
 
   const formatDue = (value?: string | null): string => {
     if (!value) return "-";
-    const [y, m, d] = value.split("-");
+    const [_y, m, d] = value.split("-");
     if (!m || !d) return value;
     return `${Number(m)}/${Number(d)}`;
   };

@@ -420,7 +420,8 @@ async function handleProjectSelectionReply(
       })
     }],
     requestedBy: userId,
-    requestedAt: new Date().toISOString()
+    requestedAt: new Date().toISOString(),
+    threadTs
   });
 
   // Save thread-level reference for potential modifications
@@ -706,7 +707,7 @@ async function handleMention(
     }
 
     // Process pending actions from parallel fetch result
-    let pendingCreateTasks: Array<{ task_name: string; assignee: string; due: string; sp: number; status: string; project: string | null; description: string | null }> | null = null;
+    let pendingCreateTasks: Array<{ task_name: string; assignee: string; due: string; sp: number; status: string; project: string | null; description: string | null; sprint: string | null }> | null = null;
     let pendingUpdateActions: Array<{ action: string; page_id: string; task_name: string; new_value: string }> | null = null;
     const pendingCreateRef = pendingCreateRefResult;
     if (pendingCreateRef) {
@@ -715,7 +716,7 @@ async function handleMention(
         const createActions = oldPending.actions.filter((a) => a.action === "create_task");
         if (createActions.length > 0) {
           pendingCreateTasks = createActions.map((a) => {
-            const parsed = JSON.parse(a.new_value) as { task_name: string; assignee: string; due: string; sp: number; status: string; project?: string | null; description?: string | null };
+            const parsed = JSON.parse(a.new_value) as { task_name: string; assignee: string; due: string; sp: number; status: string; project?: string | null; description?: string | null; sprintId?: string; sprintName?: string | null };
             return {
               task_name: parsed.task_name,
               assignee: parsed.assignee,
@@ -723,7 +724,8 @@ async function handleMention(
               sp: parsed.sp,
               status: parsed.status,
               project: parsed.project ?? null,
-              description: parsed.description ?? null
+              description: parsed.description ?? null,
+              sprint: parsed.sprintName ?? null
             };
           });
         } else {
@@ -807,6 +809,22 @@ async function handleMention(
           needsDescriptionHearing = true;
         }
 
+        // Resolve sprint from LLM output (null = backlog)
+        let resolvedSprintId: string | undefined;
+        let sprintDisplay: string | null = null;
+        if (newTask.sprint) {
+          const matchedSprint = allSprints.find(
+            (s) => s.name === newTask.sprint || s.name.includes(newTask.sprint!) || newTask.sprint!.includes(s.name)
+          );
+          if (matchedSprint) {
+            resolvedSprintId = matchedSprint.id;
+            sprintDisplay = matchedSprint.name;
+          } else {
+            sprintDisplay = `${newTask.sprint}（⚠️ 未検出）`;
+          }
+        }
+        // sprint が null → バックログ（sprintId なし）
+
         // Build task display block with description inline
         const label = result.new_tasks.length > 1 ? `【タスク${i + 1}】\n` : "";
         const lines = [
@@ -816,6 +834,7 @@ async function handleMention(
           `・SP: ${newTask.sp}`
         ];
         if (projectDisplay) lines.push(`・プロジェクト: *${projectDisplay}*`);
+        lines.push(`・スプリント: ${sprintDisplay ?? "バックログ"}`);
         if (taskDescription) lines.push(`・📝 概要: ${taskDescription}`);
         taskBlocks.push(lines.join("\n"));
 
@@ -825,7 +844,8 @@ async function handleMention(
           task_name: newTask.task_name,
           new_value: JSON.stringify({
             ...newTask,
-            sprintId: summary.sprint.id,
+            ...(resolvedSprintId ? { sprintId: resolvedSprintId } : {}),
+            sprintName: newTask.sprint,
             projectIds: resolvedProjectIds,
             ...(taskDescription ? { description: taskDescription } : {})
           })
@@ -847,7 +867,8 @@ async function handleMention(
         await savePendingAction(env.NOTIFY_CACHE, askMsg.channel, askMsg.ts, {
           actions: taskActions,
           requestedBy: userId,
-          requestedAt: new Date().toISOString()
+          requestedAt: new Date().toISOString(),
+          threadTs
         });
 
         await savePendingCreateRef(env.NOTIFY_CACHE, channel, threadTs, {
@@ -868,7 +889,8 @@ async function handleMention(
         await savePendingAction(env.NOTIFY_CACHE, confirmMsg.channel, confirmMsg.ts, {
           actions: taskActions,
           requestedBy: userId,
-          requestedAt: new Date().toISOString()
+          requestedAt: new Date().toISOString(),
+          threadTs
         });
 
         await savePendingCreateRef(env.NOTIFY_CACHE, channel, threadTs, {
@@ -906,7 +928,8 @@ async function handleMention(
       await savePendingAction(env.NOTIFY_CACHE, confirmMsg.channel, confirmMsg.ts, {
         actions: result.actions,
         requestedBy: userId,
-        requestedAt: new Date().toISOString()
+        requestedAt: new Date().toISOString(),
+        threadTs
       });
 
       // Save thread-level reference so modifications can find this pending action
@@ -1066,6 +1089,10 @@ async function handleReactionAdded(
     );
 
     await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
+    // Clean up thread-level reference to prevent stale lookups
+    if (pending.threadTs) {
+      await deletePendingCreateRef(env.NOTIFY_CACHE, channel, pending.threadTs);
+    }
 
     await chatPostMessage(
       config.slackBotToken,
@@ -1097,6 +1124,10 @@ async function handleReactionAdded(
   );
 
   await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
+  // Clean up thread-level reference to prevent stale lookups
+  if (pending.threadTs) {
+    await deletePendingCreateRef(env.NOTIFY_CACHE, channel, pending.threadTs);
+  }
 
   const summaryMsg =
     results.length > 0
@@ -1340,6 +1371,10 @@ export async function handleSlackEvents(
   const botId = event.bot_id as string | undefined;
   const subtype = event.subtype as string | undefined;
 
+  // Extract bot user ID from Slack authorizations for accurate mention detection
+  const authorizations = payload.authorizations as Array<{ user_id: string }> | undefined;
+  const botUserId = authorizations?.[0]?.user_id;
+
   // Helper: run async work in background via ctx.waitUntil, or fall back to await
   const bg = (work: Promise<void>) => {
     if (ctx) {
@@ -1370,14 +1405,19 @@ export async function handleSlackEvents(
 
     if (channel && threadTs) {
       const rawText = (event.text as string) ?? "";
-      const hasBotMention = /<@[A-Z0-9]+>/.test(rawText);
+      // Check if the bot itself is mentioned (not just any @mention)
+      const isBotMentioned = botUserId
+        ? rawText.includes(`<@${botUserId}>`)
+        : /<@[A-Z0-9]+>/.test(rawText); // fallback if authorizations unavailable
 
-      if (!hasBotMention) {
+      if (!isBotMentioned) {
         await bg((async () => {
           const handled = await handleProjectSelectionReply(env, event);
           if (!handled) {
             const createRef = await getPendingCreateRef(env.NOTIFY_CACHE, channel, threadTs);
             if (createRef) {
+              // Pending action exists — route to handleMention for modification
+              // (even if the text mentions other users like @assignee)
               await handleMention(env, event);
             } else {
               await handleAssigneeReply(env, event);
@@ -1386,6 +1426,7 @@ export async function handleSlackEvents(
           }
         })());
       }
+      // isBotMentioned === true → app_mention handler will process this
     }
   }
 

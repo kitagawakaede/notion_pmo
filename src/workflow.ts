@@ -49,6 +49,7 @@ export interface PendingNotionAction {
   }>;
   requestedBy: string;
   requestedAt: string;
+  threadTs?: string;
 }
 
 const THREAD_KEY = (channel: string, ts: string) =>

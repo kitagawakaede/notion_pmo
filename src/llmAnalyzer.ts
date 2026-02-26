@@ -537,7 +537,7 @@ export async function interpretMention(
   context: MentionContext,
   requestUserName?: string,
   conversationHistory?: MentionMessage[],
-  pendingCreateTasks?: Array<{ task_name: string; assignee: string; due: string; sp: number; status: string; project: string | null; description: string | null }> | null,
+  pendingCreateTasks?: Array<{ task_name: string; assignee: string; due: string; sp: number; status: string; project: string | null; description: string | null; sprint: string | null }> | null,
   pendingUpdateActions?: Array<{ action: string; page_id: string; task_name: string; new_value: string }> | null,
   threadContext?: Array<{ text: string; user: string }>,
   channelContext?: Array<{ text: string; user: string }>,
@@ -583,6 +583,7 @@ export async function interpretMention(
 - 必須項目: task_name（タスク名）、assignee（担当者名）、due（期限 YYYY-MM-DD）、sp（SP）
 - オプション項目: project（プロジェクト名）- ユーザーが指定した場合のみセット、未指定ならnull
 - オプション項目: description（概要）- システムが自動生成した概要。ユーザーが修正を依頼した場合のみ変更する
+- オプション項目: sprint（スプリント名）- available_sprintsに含まれるスプリント名を指定する。ユーザーが「スプリントに入れて」「現スプリントに追加」等と指定した場合にセットする。未指定またはユーザーが「スプリントはまだ設定しないで」「バックログにして」等と指示した場合はnull（バックログとして起票される）。デフォルトはnull
 - 複数タスクの同時作成に対応: スレッド内容から複数のタスクが識別できる場合、new_tasksに複数のタスクを含める
 - ⚠️ タスク情報の出典ルール（厳守）:
   - task_nameはuser_message、thread_context、channel_context、current_tasksのいずれかに根拠があること
@@ -607,7 +608,7 @@ export async function interpretMention(
 
 ■ 保留中のタスク作成の修正:
 - pending_create_tasksが提供されている場合、ユーザーは確認待ちのタスク作成に対する修正を依頼している可能性が高い
-- プロジェクト変更、担当者変更、期限変更、SP変更など、修正内容を特定できたら:
+- プロジェクト変更、担当者変更、期限変更、SP変更、スプリント変更など、修正内容を特定できたら:
   - intent="create_task"で、pending_create_tasksをベースに変更点を反映したnew_tasksを返す
   - response_textに修正後のタスク詳細と「✅をリアクションしてください」を含める（📝概要はresponse_textに含めない）
   - actionsは空配列 []
@@ -615,6 +616,10 @@ export async function interpretMention(
   - 「概要を○○にして」「概要修正: ○○」→ 該当タスクのdescriptionに修正後のテキストをセット
   - 「概要なし」「概要を削除」「スキップ」→ descriptionをnullにセット
   - 概要に言及していない修正の場合 → pending_create_tasksのdescriptionをそのまま引き継ぐ
+- スプリント（sprint）の修正:
+  - 「スプリントに入れて」「現スプリントに追加」→ available_sprintsから該当スプリント名をsprintにセット
+  - 「スプリントはまだ設定しないで」「バックログにして」「スプリント外して」→ sprintをnullにセット
+  - スプリントに言及していない修正の場合 → pending_create_tasksのsprintをそのまま引き継ぐ
 - 概要のヒアリング（pending_create_tasksのdescriptionがnullの場合）:
   - ユーザーがタスクの背景・目的・詳細を説明するテキストを返信した場合:
     → その内容を200字以内で簡潔にまとめてdescriptionにセット

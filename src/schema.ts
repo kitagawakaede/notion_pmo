@@ -396,7 +396,8 @@ export const mentionIntentSchema = z.object({
       sp: z.number(),
       status: z.string(),
       project: z.string().nullable(),
-      description: z.string().nullable()
+      description: z.string().nullable(),
+      sprint: z.string().nullable()
     })
   )
 });
@@ -440,9 +441,10 @@ export const mentionIntentJsonSchema = {
             sp: { type: "number" },
             status: { type: "string" },
             project: { type: ["string", "null"] },
-            description: { type: ["string", "null"] }
+            description: { type: ["string", "null"] },
+            sprint: { type: ["string", "null"] }
           },
-          required: ["task_name", "assignee", "due", "sp", "status", "project", "description"]
+          required: ["task_name", "assignee", "due", "sp", "status", "project", "description", "sprint"]
         }
       }
     },

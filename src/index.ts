@@ -112,6 +112,24 @@ function formatDeadlineTasksTable(
     Array<{ name: string; status: string; priority: string; sp: string; due: string }>
   >();
 
+  // Build project abbreviation cache
+  const projectAbbrCache = new Map<string, string>();
+  const abbreviateProject = (name: string): string => {
+    if (projectAbbrCache.has(name)) return projectAbbrCache.get(name)!;
+    // Short names (<=3 chars): use as-is
+    if (name.length <= 3) { projectAbbrCache.set(name, name); return name; }
+    // Extract uppercase letters from camelCase/PascalCase
+    const uppers = name.match(/[A-Z]/g);
+    if (uppers && uppers.length >= 2) { const abbr = uppers.join(""); projectAbbrCache.set(name, abbr); return abbr; }
+    // Multi-word: initials
+    const words = name.split(/[\s\-_・]+/).filter(Boolean);
+    if (words.length >= 2) { const abbr = words.map((w) => w[0].toUpperCase()).join(""); projectAbbrCache.set(name, abbr); return abbr; }
+    // Single word: first char uppercase
+    const abbr = /^[a-zA-Z]/.test(name) ? name.slice(0, 1).toUpperCase() : name.slice(0, 1);
+    projectAbbrCache.set(name, abbr);
+    return abbr;
+  };
+
   for (const assignee of summary.assignees) {
     for (const task of assignee.tasks) {
       if (task.status && isCompletedStatus(task.status)) continue;
@@ -122,8 +140,12 @@ function formatDeadlineTasksTable(
       );
       if (daysRemaining > daysThreshold) continue;
       const group = groups.get(assignee.name) ?? [];
+      // Prefix task name with project abbreviation if available
+      const projectPrefix = task.projectName
+        ? `【${abbreviateProject(task.projectName)}】`
+        : "";
       group.push({
-        name: task.name,
+        name: projectPrefix + task.name,
         status: task.status ?? "-",
         priority: task.priority ?? "-",
         sp: task.sp != null ? String(task.sp) : "-",
@@ -995,6 +1017,36 @@ async function runEveningFlow(
       avgDailySp = calcAvgDailySpFromSprint(summary, today);
     }
 
+    // Calculate yesterday's completed SP (tasks that moved to completed status)
+    const yesterdayKey = toJstDateString(now, -1);
+    const yesterdaySnapshotRaw = await env.NOTIFY_CACHE.get(
+      `sprint-task-snapshot:${summary.sprint.id}:${yesterdayKey}`,
+      "json"
+    ) as Array<{ id: string; name: string; status: string | null; sp: number | null }> | null;
+
+    let yesterdayCompletedSp = 0;
+    if (yesterdaySnapshotRaw) {
+      const prevById = new Map(yesterdaySnapshotRaw.map((t) => [t.id, t]));
+      const currentSnapshot = summary.assignees.flatMap((a) =>
+        a.tasks.map((t) => ({ id: t.id, status: t.status ?? null, sp: t.sp ?? null }))
+      );
+      for (const task of currentSnapshot) {
+        const prev = prevById.get(task.id);
+        if (!prev) continue;
+        if (isCompletedStatus(task.status) && !isCompletedStatus(prev.status)) {
+          yesterdayCompletedSp += task.sp ?? 0;
+        }
+      }
+      // Also count tasks in yesterday's snapshot that are no longer in current (removed = completed)
+      const currentIds = new Set(currentSnapshot.map((t) => t.id));
+      for (const prev of yesterdaySnapshotRaw) {
+        if (!currentIds.has(prev.id) && !isCompletedStatus(prev.status)) {
+          yesterdayCompletedSp += prev.sp ?? 0;
+        }
+      }
+      console.log(`Yesterday completed SP: ${yesterdayCompletedSp}`);
+    }
+
     // Step 2-A: Detect stagnant Doing tasks
     const eveningSnapshot = summary.assignees.flatMap((a) =>
       a.tasks.map((t) => ({
@@ -1044,7 +1096,8 @@ async function runEveningFlow(
       members,
       scheduleData,
       summary,
-      avgDailySp
+      avgDailySp,
+      yesterdayCompletedSp
     );
     console.log("Evening flow: proposal generated", {
       allocations: proposal.task_allocations.length
@@ -1157,6 +1210,54 @@ async function notifyError(_env: Env, config: AppConfig, error: Error) {
     await postSlack(config.slackErrorWebhookUrl, message);
   } catch (err) {
     console.error("Failed to send error notification", err);
+  }
+}
+
+// ── End-of-Day Reminder Flow (midnight JST) ──────────────────────────────
+
+async function runEodReminderFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  let config: AppConfig | undefined;
+  try {
+    config = getConfig(env);
+
+    if (!config.slackBotToken) {
+      return { ok: true, skipped: true, reason: "no bot token" };
+    }
+
+    const today = toJstDateString();
+    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today);
+
+    if (activeThreads.length === 0) {
+      console.log("EOD reminder: no active threads for today");
+      return { ok: true, skipped: true, reason: "no active threads" };
+    }
+
+    let reminded = 0;
+    for (const thread of activeThreads) {
+      if (config.dryRun) {
+        console.log(`DRY_RUN: would send EOD reminder to ${thread.assigneeName}`);
+        continue;
+      }
+
+      await chatPostMessage(
+        config.slackBotToken,
+        thread.channel,
+        `お疲れ様です！🌙 本日のタスクのステータスを更新しましょう！\n進捗があれば共有してください。`,
+        undefined,
+        thread.ts
+      );
+      reminded++;
+    }
+
+    console.log("EOD reminder flow complete", { reason, reminded });
+    return { ok: true, reason, reminded };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runEodReminderFlow failed", err);
+    return { ok: false, error: err.message };
   }
 }
 
@@ -1315,6 +1416,11 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
+  if (path === "/pmo/eod-reminder") {
+    const result = await runEodReminderFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
   if (path === "/query" && request.method === "POST") {
     let body: Record<string, unknown>;
     try {
@@ -1465,6 +1571,9 @@ export default {
     } else if (event.cron === "15 * * * *") {
       // Every hour at :15 — ☎️ Phone reminder DMs
       ctx.waitUntil(runPhoneReminderFlow(env, "cron"));
+    } else if (event.cron === "0 15 * * *") {
+      // 00:00 JST (midnight) — EOD status update reminder
+      ctx.waitUntil(runEodReminderFlow(env, "cron"));
     } else {
       // Fallback: legacy reports
       ctx.waitUntil(runReport(env, "cron"));

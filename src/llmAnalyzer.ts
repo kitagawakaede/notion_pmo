@@ -389,7 +389,8 @@ export async function interpretRepliesAndPropose(
   members: Member[],
   scheduleData?: ScheduleData | null,
   summary?: SprintTasksSummary | null,
-  avgDailySp?: number | null
+  avgDailySp?: number | null,
+  yesterdayCompletedSp?: number
 ): Promise<AllocationProposal> {
   const today = toJstDateString();
   const scheduleContext = scheduleData
@@ -407,6 +408,7 @@ pm_reportには以下のセクションを順番に含めてください:
   - 進捗SP: {progress_sp} SP
   - 残りSP: {remaining_sp} SP
   - 残り日数: {remaining_days} 日
+  - 昨日消化SP: {yesterday_completed_sp} SP
   - 必要日次消化SP: {required_sp_per_day} SP/日
   - 過去7日平均消化SP: {avg_daily_sp} SP/日
 
@@ -415,8 +417,7 @@ pm_reportには以下のセクションを順番に含めてください:
   - 持ちタスク数と合計残SP
   - 過去7日の平均SP消化速度（SP/日）
   - 現ペースで持ちタスクが全て完了する予測日
-  - スプリント終了日までの遊休日数（= スプリント終了日 - 予測完了日。マイナスなら「不足」と表示）
-  - 遊休日数が2日以上ある場合は「余力あり」、マイナスの場合は「タスク過多」と明記する` : ""}
+  - 予測完了日がスプリント終了日より前なら「余力あり」、後なら「タスク過多」と明記する` : ""}
 日本語で回答してください。
 
 ■ pm_report フォーマットルール（Slack向け）:
@@ -462,6 +463,7 @@ pm_reportには以下のセクションを順番に含めてください:
       end_date: summary.sprint.end_date
     } : null,
     avg_daily_sp_team: avgDailySp,
+    yesterday_completed_sp: yesterdayCompletedSp ?? 0,
     members: members.map((m) => ({
       name: m.name,
       availableHours: m.availableHours,

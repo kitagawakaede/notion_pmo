@@ -71,7 +71,8 @@ async function executeTaskCreation(
     taskSprintRelationProperty: string;
     dryRun: boolean;
   },
-  task: NewTask & { sprintId?: string; projectIds?: string[]; project?: string | null }
+  task: NewTask & { sprintId?: string; projectIds?: string[]; project?: string | null },
+  userMaps?: { dbUserMap: Map<string, string>; notionUserMap: Map<string, string> }
 ): Promise<{ message: string; pageId?: string }> {
   if (!config.taskDbId) {
     return { message: "❌ TASK_DB_URL が未設定のためタスクを作成できません" };
@@ -94,13 +95,11 @@ async function executeTaskCreation(
   };
 
   let assigneeId: string | undefined;
-  if (config.taskDbId) {
-    const dbUserMap = await buildUserMapFromDatabase(config.notionToken, config.taskDbId);
-    assigneeId = findUser(dbUserMap, task.assignee);
-  }
+  const dbMap = userMaps?.dbUserMap ?? (config.taskDbId ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId) : new Map<string, string>());
+  assigneeId = findUser(dbMap, task.assignee);
   if (!assigneeId) {
-    const userMap = await fetchNotionUserMap(config.notionToken);
-    assigneeId = findUser(userMap, task.assignee);
+    const notionMap = userMaps?.notionUserMap ?? await fetchNotionUserMap(config.notionToken);
+    assigneeId = findUser(notionMap, task.assignee);
   }
 
   const properties: Record<string, unknown> = {
@@ -1024,35 +1023,47 @@ async function handleReactionAdded(
   // Check if this contains task creation actions
   const createActions = pending.actions.filter((a) => a.action === "create_task");
   if (createActions.length > 0) {
-    const allResults: string[] = [];
-    const notificationLines: string[] = [];
+    // Pre-fetch user maps once (avoids repeated API calls per task)
+    const dbUserMap = config.taskDbId
+      ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId)
+      : new Map<string, string>();
+    const notionUserMap = await fetchNotionUserMap(config.notionToken);
+    const userMaps = { dbUserMap, notionUserMap };
 
-    for (const createAction of createActions) {
-      const newTask = JSON.parse(createAction.new_value) as NewTask & { sprintId?: string; projectIds?: string[]; project?: string | null; description?: string };
-      const result = await executeTaskCreation(
-        {
-          notionToken: config.notionToken,
-          taskDbId: config.taskDbId,
-          taskSprintRelationProperty: config.taskSprintRelationProperty,
-          dryRun: config.dryRun
-        },
-        newTask
-      );
+    // Create all tasks in parallel
+    const taskResults = await Promise.all(
+      createActions.map(async (createAction) => {
+        const newTask = JSON.parse(createAction.new_value) as NewTask & { sprintId?: string; projectIds?: string[]; project?: string | null; description?: string };
+        const result = await executeTaskCreation(
+          {
+            notionToken: config.notionToken,
+            taskDbId: config.taskDbId,
+            taskSprintRelationProperty: config.taskSprintRelationProperty,
+            dryRun: config.dryRun
+          },
+          newTask,
+          userMaps
+        );
 
-      // Append description as page content if available
-      if (result.pageId && newTask.description) {
-        try {
-          await appendPageContent(config.notionToken, result.pageId, newTask.description);
-          console.log(`Description appended to page ${result.pageId}`);
-        } catch (err) {
-          console.warn(`Failed to append description: ${(err as Error).message}`);
+        // Append description as page content if available
+        if (result.pageId && newTask.description) {
+          try {
+            await appendPageContent(config.notionToken, result.pageId, newTask.description);
+            console.log(`Description appended to page ${result.pageId}`);
+          } catch (err) {
+            console.warn(`Failed to append description: ${(err as Error).message}`);
+          }
         }
-      }
 
-      allResults.push(result.message);
-      notificationLines.push(`・タスク追加: ${newTask.task_name}（担当: ${newTask.assignee}、期限: ${newTask.due}、SP: ${newTask.sp}）`);
-      console.log(`Task creation executed: "${newTask.task_name}"`);
-    }
+        console.log(`Task creation executed: "${newTask.task_name}"`);
+        return { result, newTask };
+      })
+    );
+
+    const allResults = taskResults.map((r) => r.result.message);
+    const notificationLines = taskResults.map(
+      (r) => `・タスク追加: ${r.newTask.task_name}（担当: ${r.newTask.assignee}、期限: ${r.newTask.due}、SP: ${r.newTask.sp}）`
+    );
 
     await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
 

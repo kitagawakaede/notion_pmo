@@ -21,6 +21,7 @@ import {
   isCompletedStatus
 } from "./notionApi";
 import { handleSlackEvents } from "./slackEvents";
+import { handleSlackInteractions, buildPmReportButtons, buildEodReminderButtons } from "./slackInteractions";
 import { fetchMembers } from "./memberApi";
 import {
   analyzeTasksAndMembers,
@@ -1150,7 +1151,8 @@ async function runEveningFlow(
     const pmResult = await chatPostMessage(
       config.slackBotToken,
       channel,
-      pmReportText
+      pmReportText,
+      buildPmReportButtons()
     );
 
     // Save PM thread so Events API can route PM's reply (Step 8)
@@ -1292,7 +1294,7 @@ async function runEodReminderFlow(
         config.slackBotToken,
         thread.channel,
         `お疲れ様です！🌙 本日のタスクのステータスを更新しましょう！\n進捗があれば共有してください。`,
-        undefined,
+        buildEodReminderButtons(),
         thread.ts
       );
       reminded++;
@@ -1403,6 +1405,11 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
   if (path === "/slack/reaction" && request.method === "POST") {
     // Reaction events come via Events API; this endpoint is a convenience alias
     return handleSlackEvents(request, env, ctx);
+  }
+
+  // Slack Interactivity (button clicks, select menus, etc.)
+  if (path === "/slack/interactions" && request.method === "POST") {
+    return handleSlackInteractions(request, env, ctx);
   }
 
   if (path === "/run-now") {

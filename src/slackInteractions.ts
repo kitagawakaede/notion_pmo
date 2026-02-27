@@ -52,7 +52,7 @@ async function verifySlackSignature(
 
 // ── Block Kit button builders ──────────────────────────────────────────────
 
-/** Build an actions block with approve/cancel buttons for task or update confirmation */
+/** Build an actions block with approve/modify/cancel buttons for task or update confirmation */
 export function buildApprovalButtons(actionIdPrefix: string): unknown[] {
   return [
     {
@@ -64,6 +64,11 @@ export function buildApprovalButtons(actionIdPrefix: string): unknown[] {
           text: { type: "plain_text", text: "✅ 承認", emoji: true },
           style: "primary",
           action_id: `${actionIdPrefix}_approve`
+        },
+        {
+          type: "button",
+          text: { type: "plain_text", text: "✏️ 修正する", emoji: true },
+          action_id: `${actionIdPrefix}_modify`
         },
         {
           type: "button",
@@ -226,6 +231,8 @@ export async function handleSlackInteractions(
   // Route to appropriate handler
   if (actionId === "task_action_approve" || actionId === "task_action_cancel") {
     await bg(handleTaskActionButton(env, payload, actionId === "task_action_approve"));
+  } else if (actionId === "task_action_modify") {
+    await bg(handleTaskModifyButton(env, payload));
   } else if (actionId === "pm_report_approve" || actionId === "pm_report_reject") {
     await bg(handlePmReportButton(env, payload, actionId === "pm_report_approve"));
   } else if (actionId.startsWith("eod_")) {
@@ -389,6 +396,49 @@ async function handleTaskActionButton(
   }
 
   console.log(`Action approved by ${userId}: channel=${channel} ts=${messageTs}`);
+}
+
+// ── Task modify button handler ─────────────────────────────────────────────
+
+async function handleTaskModifyButton(
+  env: Bindings,
+  payload: SlackInteractionPayload
+): Promise<void> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return;
+
+  const channel = payload.channel.id;
+  const messageTs = payload.message.ts;
+  const threadTs = payload.message.thread_ts ?? messageTs;
+  const userId = payload.user.id;
+
+  // Remove buttons from original message, keep the content
+  const originalText = payload.message.text;
+  const blocksWithoutActions = (payload.message.blocks ?? []).filter(
+    (b: unknown) => (b as Record<string, unknown>).type !== "actions"
+  );
+
+  await chatUpdate(
+    config.slackBotToken,
+    channel,
+    messageTs,
+    originalText,
+    [
+      ...blocksWithoutActions,
+      textSection(`✏️ <@${userId}> が修正を選択しました`)
+    ]
+  );
+
+  // Post a prompt in the thread asking for modification details
+  await chatPostMessage(
+    config.slackBotToken,
+    channel,
+    `<@${userId}> 修正内容をこのスレッドに返信してください。\n例: 「担当を佐藤に変更」「SPを5に」「期限を来週金曜に」`,
+    undefined,
+    threadTs
+  );
+
+  console.log(`Action modify requested by ${userId}: channel=${channel} ts=${messageTs}`);
 }
 
 // ── PM Report approval button handler ──────────────────────────────────────

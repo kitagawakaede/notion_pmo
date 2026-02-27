@@ -90,15 +90,9 @@ export function buildPmReportButtons(): unknown[] {
       elements: [
         {
           type: "button",
-          text: { type: "plain_text", text: "✅ 全承認", emoji: true },
+          text: { type: "plain_text", text: "✅ OK", emoji: true },
           style: "primary",
           action_id: "pm_report_approve"
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "❌ 却下", emoji: true },
-          style: "danger",
-          action_id: "pm_report_reject"
         }
       ]
     }
@@ -233,8 +227,8 @@ export async function handleSlackInteractions(
     await bg(handleTaskActionButton(env, payload, actionId === "task_action_approve"));
   } else if (actionId === "task_action_modify") {
     await bg(handleTaskModifyButton(env, payload));
-  } else if (actionId === "pm_report_approve" || actionId === "pm_report_reject") {
-    await bg(handlePmReportButton(env, payload, actionId === "pm_report_approve"));
+  } else if (actionId === "pm_report_approve") {
+    await bg(handlePmReportButton(env, payload));
   } else if (actionId.startsWith("eod_")) {
     await bg(handleEodButton(env, payload, actionId));
   }
@@ -445,8 +439,7 @@ async function handleTaskModifyButton(
 
 async function handlePmReportButton(
   env: Bindings,
-  payload: SlackInteractionPayload,
-  approved: boolean
+  payload: SlackInteractionPayload
 ): Promise<void> {
   const config = getConfig(env);
   if (!config.slackBotToken) return;
@@ -468,22 +461,6 @@ async function handlePmReportButton(
   const blocksWithoutActions = (payload.message.blocks ?? []).filter(
     (b: unknown) => (b as Record<string, unknown>).type !== "actions"
   );
-
-  if (!approved) {
-    await chatUpdate(
-      config.slackBotToken,
-      channel,
-      messageTs,
-      originalText + "\n\n❌ 却下されました",
-      [
-        ...blocksWithoutActions,
-        textSection(`❌ <@${userId}> が却下しました`)
-      ]
-    );
-    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
-    console.log(`PM report rejected by ${userId}`);
-    return;
-  }
 
   // Full approval
   const proposal = JSON.parse(pmThread.proposalJson) as AllocationProposal;
@@ -510,7 +487,7 @@ async function handlePmReportButton(
     originalText + "\n\n" + summaryMsg,
     [
       ...blocksWithoutActions,
-      textSection(`✅ <@${userId}> が全承認しました\n\n${summaryMsg}`)
+      textSection(`✅ <@${userId}> がOKしました\n\n${summaryMsg}`)
     ]
   );
 

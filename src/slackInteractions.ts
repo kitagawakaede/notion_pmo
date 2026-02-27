@@ -1,6 +1,6 @@
 import type { Bindings } from "./config";
 import { getConfig } from "./config";
-import { chatPostMessage, chatUpdate, conversationsOpen } from "./slackBot";
+import { chatPostMessage, chatUpdate, conversationsOpen, conversationsReplies } from "./slackBot";
 import {
   getPendingAction,
   deletePendingAction,
@@ -10,7 +10,8 @@ import {
   getThreadState,
   saveThreadState,
   toJstDateString,
-  appendReply
+  appendReply,
+  savePhoneReminder
 } from "./workflow";
 import {
   executeNotionActions,
@@ -139,15 +140,17 @@ function textSection(text: string): unknown {
 
 interface SlackInteractionPayload {
   type: string;
+  callback_id?: string;
   user: { id: string; username?: string };
   channel: { id: string };
   message: {
     ts: string;
     text: string;
+    user?: string;
     blocks?: unknown[];
     thread_ts?: string;
   };
-  actions: Array<{
+  actions?: Array<{
     type: string;
     action_id: string;
     value?: string;
@@ -203,13 +206,6 @@ export async function handleSlackInteractions(
     return new Response("Invalid payload JSON", { status: 400 });
   }
 
-  if (payload.type !== "block_actions") {
-    return new Response("ok");
-  }
-
-  const action = payload.actions[0];
-  if (!action) return new Response("ok");
-
   // Background processing
   const bg = (work: Promise<void>) => {
     if (ctx) {
@@ -219,6 +215,22 @@ export async function handleSlackInteractions(
     }
     return Promise.resolve();
   };
+
+  // ── Message shortcut (message_action) ──────────────────────────────────
+  if (payload.type === "message_action") {
+    if (payload.callback_id === "set_reminder") {
+      await bg(handleSetReminderShortcut(env, payload));
+    }
+    return new Response("ok");
+  }
+
+  // ── Button clicks (block_actions) ──────────────────────────────────────
+  if (payload.type !== "block_actions") {
+    return new Response("ok");
+  }
+
+  const action = payload.actions?.[0];
+  if (!action) return new Response("ok");
 
   const actionId = action.action_id;
 
@@ -556,4 +568,67 @@ async function handleEodButton(
   }
 
   console.log(`EOD response from ${userId}: ${actionId}`);
+}
+
+// ── Message shortcut: set reminder ─────────────────────────────────────────
+
+async function handleSetReminderShortcut(
+  env: Bindings,
+  payload: SlackInteractionPayload
+): Promise<void> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) return;
+
+  const userId = payload.user.id;
+  const channel = payload.channel.id;
+  const messageTs = payload.message.ts;
+  // Use thread_ts if the message is in a thread, otherwise use the message itself
+  const threadTs = payload.message.thread_ts ?? messageTs;
+
+  // Fetch thread content
+  const messages = await conversationsReplies(
+    config.slackBotToken,
+    channel,
+    threadTs,
+    100,
+    true
+  );
+
+  if (messages.length === 0) return;
+
+  const threadContent = messages
+    .map((m) => `<@${m.user}>: ${m.text}`)
+    .join("\n\n");
+
+  const threadLink = `https://slack.com/archives/${channel}/p${threadTs.replace(".", "")}`;
+
+  const dmText =
+    `☎️ *リマインド設定されたスレッド*\n` +
+    `<${threadLink}|スレッドを見る>\n\n` +
+    `───────────────\n` +
+    `${threadContent}\n` +
+    `───────────────\n` +
+    `_1時間ごとにリマインドします。解除するには ☎️ リアクションを外すか、「リマインド解除」と返信してください。_`;
+
+  // Open DM channel with user
+  const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
+  if (!dmChannelId) {
+    console.error(`Failed to open DM channel for user ${userId}`);
+    return;
+  }
+
+  // Send initial DM
+  await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
+
+  // Save reminder to KV (same as ☎️ reaction flow)
+  const now = new Date().toISOString();
+  await savePhoneReminder(env.NOTIFY_CACHE, userId, channel, threadTs, {
+    userId,
+    channel,
+    threadTs,
+    createdAt: now,
+    lastRemindedAt: now
+  });
+
+  console.log(`Reminder set via shortcut: user=${userId}, channel=${channel}, threadTs=${threadTs}`);
 }

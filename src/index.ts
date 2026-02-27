@@ -113,10 +113,19 @@ function formatDeadlineTasksTable(
     Array<{ name: string; status: string; priority: string; sp: string; due: string }>
   >();
 
+  // Known project abbreviation overrides (Japanese names etc. that can't be auto-abbreviated)
+  const PROJECT_ABBREVIATION_OVERRIDES: ReadonlyMap<string, string> = new Map([
+    ["三井住友海上", "ms"],
+  ]);
+
   // Build project abbreviation cache
   const projectAbbrCache = new Map<string, string>();
   const abbreviateProject = (name: string): string => {
     if (projectAbbrCache.has(name)) return projectAbbrCache.get(name)!;
+    // Check explicit overrides first
+    for (const [pattern, abbr] of PROJECT_ABBREVIATION_OVERRIDES) {
+      if (name === pattern || name.startsWith(pattern)) { projectAbbrCache.set(name, abbr); return abbr; }
+    }
     // Short names (<=3 chars): use as-is
     if (name.length <= 3) { projectAbbrCache.set(name, name); return name; }
     // Extract uppercase letters from camelCase/PascalCase

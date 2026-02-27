@@ -28,7 +28,7 @@ import {
   interpretRepliesAndPropose,
   matchTasksToSchedule
 } from "./llmAnalyzer";
-import { chatPostMessage } from "./slackBot";
+import { chatPostMessage, conversationsReplies, conversationsOpen } from "./slackBot";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -37,7 +37,11 @@ import {
   addActiveThread,
   getActiveThreads,
   getReplies,
-  toJstDateString
+  toJstDateString,
+  listAllPhoneReminders,
+  savePhoneReminder,
+  deletePhoneReminder,
+  savePhoneReminderDm
 } from "./workflow";
 
 interface Env extends Bindings {}
@@ -110,6 +114,24 @@ function formatDeadlineTasksTable(
     Array<{ name: string; status: string; priority: string; sp: string; due: string }>
   >();
 
+  // Build project abbreviation cache
+  const projectAbbrCache = new Map<string, string>();
+  const abbreviateProject = (name: string): string => {
+    if (projectAbbrCache.has(name)) return projectAbbrCache.get(name)!;
+    // Short names (<=3 chars): use as-is
+    if (name.length <= 3) { projectAbbrCache.set(name, name); return name; }
+    // Extract uppercase letters from camelCase/PascalCase
+    const uppers = name.match(/[A-Z]/g);
+    if (uppers && uppers.length >= 2) { const abbr = uppers.join(""); projectAbbrCache.set(name, abbr); return abbr; }
+    // Multi-word: initials
+    const words = name.split(/[\s\-_・]+/).filter(Boolean);
+    if (words.length >= 2) { const abbr = words.map((w) => w[0].toUpperCase()).join(""); projectAbbrCache.set(name, abbr); return abbr; }
+    // Single word: first char uppercase
+    const abbr = /^[a-zA-Z]/.test(name) ? name.slice(0, 1).toUpperCase() : name.slice(0, 1);
+    projectAbbrCache.set(name, abbr);
+    return abbr;
+  };
+
   for (const assignee of summary.assignees) {
     for (const task of assignee.tasks) {
       if (task.status && isCompletedStatus(task.status)) continue;
@@ -120,8 +142,12 @@ function formatDeadlineTasksTable(
       );
       if (daysRemaining > daysThreshold) continue;
       const group = groups.get(assignee.name) ?? [];
+      // Prefix task name with project abbreviation if available
+      const projectPrefix = task.projectName
+        ? `【${abbreviateProject(task.projectName)}】`
+        : "";
       group.push({
-        name: task.name,
+        name: projectPrefix + task.name,
         status: task.status ?? "-",
         priority: task.priority ?? "-",
         sp: task.sp != null ? String(task.sp) : "-",
@@ -993,6 +1019,46 @@ async function runEveningFlow(
       avgDailySp = calcAvgDailySpFromSprint(summary, today);
     }
 
+    // Calculate yesterday's consumed SP from 5AM progress_sp snapshots
+    // (前日AM5時→当日AM5時の進捗SPの差)
+    const yesterdayKey = toJstDateString(now, -1);
+    const todayProgressSpRaw = await env.NOTIFY_CACHE.get(
+      `progress-sp-5am:${summary.sprint.id}:${today}`,
+      "json"
+    ) as { progress_sp: number | null } | null;
+    const yesterdayProgressSpRaw = await env.NOTIFY_CACHE.get(
+      `progress-sp-5am:${summary.sprint.id}:${yesterdayKey}`,
+      "json"
+    ) as { progress_sp: number | null } | null;
+
+    let yesterdayCompletedSp = 0;
+    if (todayProgressSpRaw?.progress_sp != null && yesterdayProgressSpRaw?.progress_sp != null) {
+      yesterdayCompletedSp = todayProgressSpRaw.progress_sp - yesterdayProgressSpRaw.progress_sp;
+      console.log(`Yesterday consumed SP (5AM snapshots): ${yesterdayCompletedSp} (${yesterdayProgressSpRaw.progress_sp} → ${todayProgressSpRaw.progress_sp})`);
+    } else {
+      // Fallback: task status change method
+      const yesterdaySnapshotRaw = await env.NOTIFY_CACHE.get(
+        `sprint-task-snapshot:${summary.sprint.id}:${yesterdayKey}`,
+        "json"
+      ) as Array<{ id: string; name: string; status: string | null; sp: number | null }> | null;
+
+      if (yesterdaySnapshotRaw) {
+        const prevById = new Map(yesterdaySnapshotRaw.map((t) => [t.id, t]));
+        const currentSnapshot = summary.assignees.flatMap((a) =>
+          a.tasks.map((t) => ({ id: t.id, status: t.status ?? null, sp: t.sp ?? null }))
+        );
+        for (const task of currentSnapshot) {
+          const prev = prevById.get(task.id);
+          if (!prev) continue;
+          // Count SP for any status change (not just completion)
+          if (task.status !== prev.status) {
+            yesterdayCompletedSp += task.sp ?? 0;
+          }
+        }
+      }
+      console.log(`Yesterday completed SP (fallback): ${yesterdayCompletedSp}`);
+    }
+
     // Step 2-A: Detect stagnant Doing tasks
     const eveningSnapshot = summary.assignees.flatMap((a) =>
       a.tasks.map((t) => ({
@@ -1042,7 +1108,8 @@ async function runEveningFlow(
       members,
       scheduleData,
       summary,
-      avgDailySp
+      avgDailySp,
+      yesterdayCompletedSp
     );
     console.log("Evening flow: proposal generated", {
       allocations: proposal.task_allocations.length
@@ -1158,6 +1225,178 @@ async function notifyError(_env: Env, config: AppConfig, error: Error) {
   }
 }
 
+// ── Progress SP Snapshot (05:00 JST = 20:00 UTC) ─────────────────────────
+
+/** Save sprint progress_sp snapshot at 5AM JST for daily consumption calculation */
+async function runProgressSpSnapshot(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  let config: AppConfig | undefined;
+  try {
+    config = getConfig(env);
+    const now = new Date();
+    const today = toJstDateString(now);
+    const summary = await fetchCurrentSprintTasksSummary(config, now);
+
+    const progressSp = summary.sprint_metrics?.progress_sp ?? null;
+    const snapshotKey = `progress-sp-5am:${summary.sprint.id}:${today}`;
+
+    await env.NOTIFY_CACHE.put(snapshotKey, JSON.stringify({
+      progress_sp: progressSp,
+      timestamp: now.toISOString()
+    }), { expirationTtl: config.dedupeTtlSeconds });
+
+    console.log(`Progress SP snapshot saved: ${snapshotKey} = ${progressSp}`);
+    return { ok: true, reason, progressSp, date: today };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runProgressSpSnapshot failed", err);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ── End-of-Day Reminder Flow (midnight JST) ──────────────────────────────
+
+async function runEodReminderFlow(
+  env: Env,
+  reason: string
+): Promise<Record<string, unknown>> {
+  let config: AppConfig | undefined;
+  try {
+    config = getConfig(env);
+
+    if (!config.slackBotToken) {
+      return { ok: true, skipped: true, reason: "no bot token" };
+    }
+
+    const today = toJstDateString();
+    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today);
+
+    if (activeThreads.length === 0) {
+      console.log("EOD reminder: no active threads for today");
+      return { ok: true, skipped: true, reason: "no active threads" };
+    }
+
+    let reminded = 0;
+    for (const thread of activeThreads) {
+      if (config.dryRun) {
+        console.log(`DRY_RUN: would send EOD reminder to ${thread.assigneeName}`);
+        continue;
+      }
+
+      await chatPostMessage(
+        config.slackBotToken,
+        thread.channel,
+        `お疲れ様です！🌙 本日のタスクのステータスを更新しましょう！\n進捗があれば共有してください。`,
+        undefined,
+        thread.ts
+      );
+      reminded++;
+    }
+
+    console.log("EOD reminder flow complete", { reason, reminded });
+    return { ok: true, reason, reminded };
+  } catch (error) {
+    const err = error as Error;
+    console.error("runEodReminderFlow failed", err);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ── Phone Reminder Flow (☎️ hourly DM reminders) ──────────────────────────
+
+async function runPhoneReminderFlow(
+  env: Env,
+  trigger: "cron" | "manual"
+): Promise<{ ok: boolean; message: string }> {
+  const config = getConfig(env);
+  if (!config.slackBotToken) {
+    return { ok: false, message: "SLACK_BOT_TOKEN not configured" };
+  }
+
+  const reminders = await listAllPhoneReminders(env.NOTIFY_CACHE);
+  if (reminders.length === 0) {
+    console.log(`runPhoneReminderFlow(${trigger}): no active reminders`);
+    return { ok: true, message: "No active phone reminders" };
+  }
+
+  const now = new Date();
+  let sentCount = 0;
+
+  for (const reminder of reminders) {
+    // Check if 1 hour has passed since last reminder
+    const lastReminded = new Date(reminder.lastRemindedAt);
+    const msSinceLastRemind = now.getTime() - lastReminded.getTime();
+    if (msSinceLastRemind < 60 * 60 * 1000) continue;
+
+    try {
+      // Fetch only the reacted message (not full thread)
+      let messages: Awaited<ReturnType<typeof conversationsReplies>> = [];
+      try {
+        messages = await conversationsReplies(
+          config.slackBotToken,
+          reminder.channel,
+          reminder.threadTs,
+          1,
+          true
+        );
+        if (messages.length > 1) messages = [messages[0]];
+      } catch {
+        // thread_not_found — likely a thread reply; will send link-only
+      }
+
+      const threadLink = `https://slack.com/archives/${reminder.channel}/p${reminder.threadTs.replace(".", "")}`;
+
+      let dmText: string;
+      if (messages.length > 0) {
+        const msgContent = `<@${messages[0].user}>: ${messages[0].text}`;
+        dmText =
+          `☎️ *メッセージリマインド*\n` +
+          `<${threadLink}|メッセージを見る>\n\n` +
+          `───────────────\n` +
+          `${msgContent}\n` +
+          `───────────────\n` +
+          `_このメッセージにスタンプを付けるとリマインドを停止します。_`;
+      } else {
+        dmText =
+          `☎️ *メッセージリマインド*\n` +
+          `<${threadLink}|メッセージを見る>\n\n` +
+          `_このメッセージにスタンプを付けるとリマインドを停止します。_`;
+      }
+
+      const dmChannelId = await conversationsOpen(config.slackBotToken, reminder.userId);
+      if (!dmChannelId) continue;
+
+      const dmResult = await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
+
+      // Save DM→reminder mapping so reacting to the DM can stop the reminder
+      await savePhoneReminderDm(env.NOTIFY_CACHE, dmChannelId, dmResult.ts, {
+        userId: reminder.userId,
+        channel: reminder.channel,
+        threadTs: reminder.threadTs
+      });
+
+      // Update lastRemindedAt
+      await savePhoneReminder(
+        env.NOTIFY_CACHE,
+        reminder.userId,
+        reminder.channel,
+        reminder.threadTs,
+        { ...reminder, lastRemindedAt: now.toISOString() }
+      );
+
+      sentCount++;
+    } catch (err) {
+      console.error(`Phone reminder failed for user=${reminder.userId} thread=${reminder.threadTs}:`, err);
+    }
+  }
+
+  const msg = `Sent ${sentCount} phone reminders out of ${reminders.length} active (trigger=${trigger})`;
+  console.log(`runPhoneReminderFlow: ${msg}`);
+  return { ok: true, message: msg };
+}
+
 // ── HTTP handler ───────────────────────────────────────────────────────────
 
 async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
@@ -1228,6 +1467,21 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
 
   if (path === "/pmo/pm-reminder") {
     const result = await runPmReminderFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  if (path === "/pmo/phone-reminder") {
+    const result = await runPhoneReminderFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  if (path === "/pmo/eod-reminder") {
+    const result = await runEodReminderFlow(env, "manual");
+    return jsonResponse(result, result.ok ? 200 : 500);
+  }
+
+  if (path === "/pmo/progress-snapshot") {
+    const result = await runProgressSpSnapshot(env, "manual");
     return jsonResponse(result, result.ok ? 200 : 500);
   }
 
@@ -1366,7 +1620,10 @@ export default {
   },
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     // Branch by cron expression
-    if (event.cron === "0 0 * * *") {
+    if (event.cron === "0 20 * * *") {
+      // 05:00 JST — Save progress SP snapshot
+      ctx.waitUntil(runProgressSpSnapshot(env, "cron"));
+    } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
       ctx.waitUntil(runMorningFlow(env, "cron"));
     } else if (event.cron === "10,20,30,40,50 0 * * *") {
@@ -1375,9 +1632,18 @@ export default {
     } else if (event.cron === "0 1 * * *") {
       // 10:00 JST — PM report (Steps 6-7)
       ctx.waitUntil(runEveningFlow(env, "cron"));
-    } else if (event.cron === "0 2-10 * * *") {
-      // 11:00-19:00 JST (hourly) — PM reminder if unreplied
-      ctx.waitUntil(runPmReminderFlow(env, "cron"));
+    } else if (event.cron === "0,15 * * * *") {
+      // Every hour at :00 and :15 — combined trigger
+      // ☎️ Phone reminder: always (24h)
+      ctx.waitUntil(runPhoneReminderFlow(env, "cron"));
+      // PM reminder & EOD: time-gated by JST hour
+      const jstHour = (new Date().getUTCHours() + 9) % 24;
+      if (jstHour >= 11 && jstHour <= 19) {
+        ctx.waitUntil(runPmReminderFlow(env, "cron"));
+      }
+      if (jstHour === 0) {
+        ctx.waitUntil(runEodReminderFlow(env, "cron"));
+      }
     } else {
       // Fallback: legacy reports
       ctx.waitUntil(runReport(env, "cron"));

@@ -321,3 +321,113 @@ export async function deletePendingCreateRef(
 ): Promise<void> {
   await kv.delete(PENDING_CREATE_REF_KEY(channel, threadTs));
 }
+
+// ── Phone Reminder (☎️ reaction-based thread reminders) ─────────────────
+
+export interface PhoneReminder {
+  userId: string;
+  channel: string;
+  threadTs: string;
+  createdAt: string;
+  lastRemindedAt: string;
+}
+
+const PHONE_REMINDER_KEY = (userId: string, channel: string, threadTs: string) =>
+  `phone-reminder:${userId}:${channel}:${threadTs}`;
+
+const PHONE_REMINDER_TTL = 30 * 24 * 3600; // 30 days
+
+export async function savePhoneReminder(
+  kv: KVNamespace,
+  userId: string,
+  channel: string,
+  threadTs: string,
+  reminder: PhoneReminder
+): Promise<void> {
+  await kv.put(
+    PHONE_REMINDER_KEY(userId, channel, threadTs),
+    JSON.stringify(reminder),
+    { expirationTtl: PHONE_REMINDER_TTL }
+  );
+}
+
+export async function getPhoneReminder(
+  kv: KVNamespace,
+  userId: string,
+  channel: string,
+  threadTs: string
+): Promise<PhoneReminder | null> {
+  const raw = await kv.get(PHONE_REMINDER_KEY(userId, channel, threadTs));
+  if (!raw) return null;
+  return JSON.parse(raw) as PhoneReminder;
+}
+
+export async function deletePhoneReminder(
+  kv: KVNamespace,
+  userId: string,
+  channel: string,
+  threadTs: string
+): Promise<void> {
+  await kv.delete(PHONE_REMINDER_KEY(userId, channel, threadTs));
+}
+
+export async function listAllPhoneReminders(
+  kv: KVNamespace
+): Promise<PhoneReminder[]> {
+  const reminders: PhoneReminder[] = [];
+  let cursor: string | undefined;
+
+  do {
+    const result = await kv.list({
+      prefix: "phone-reminder:",
+      cursor
+    });
+
+    for (const key of result.keys) {
+      const raw = await kv.get(key.name);
+      if (raw) {
+        reminders.push(JSON.parse(raw) as PhoneReminder);
+      }
+    }
+
+    cursor = result.list_complete ? undefined : result.cursor;
+  } while (cursor);
+
+  return reminders;
+}
+
+// ── Phone Reminder DM → Reminder mapping ────────────────────────────────
+// Maps a DM message (sent by the bot) back to the original phone reminder,
+// so reacting to the DM can stop the reminder.
+
+const PHONE_REMINDER_DM_KEY = (dmChannel: string, dmTs: string) =>
+  `phone-reminder-dm:${dmChannel}:${dmTs}`;
+
+export interface PhoneReminderDmRef {
+  userId: string;
+  channel: string;
+  threadTs: string;
+}
+
+export async function savePhoneReminderDm(
+  kv: KVNamespace,
+  dmChannel: string,
+  dmTs: string,
+  ref: PhoneReminderDmRef
+): Promise<void> {
+  await kv.put(
+    PHONE_REMINDER_DM_KEY(dmChannel, dmTs),
+    JSON.stringify(ref),
+    { expirationTtl: PHONE_REMINDER_TTL }
+  );
+}
+
+export async function getPhoneReminderDm(
+  kv: KVNamespace,
+  dmChannel: string,
+  dmTs: string
+): Promise<PhoneReminderDmRef | null> {
+  const raw = await kv.get(PHONE_REMINDER_DM_KEY(dmChannel, dmTs));
+  if (!raw) return null;
+  return JSON.parse(raw) as PhoneReminderDmRef;
+}

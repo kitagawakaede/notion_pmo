@@ -80,7 +80,8 @@ export const sprintTasksSchema = z.object({
           category: z.string().optional().nullable(),
           subItem: z.string().optional().nullable(),
           company: z.string().optional().nullable(),
-          url: z.string().url().optional().nullable()
+          url: z.string().url().optional().nullable(),
+          projectName: z.string().optional().nullable()
         })
       )
     })
@@ -131,7 +132,8 @@ export const sprintTasksJsonSchema = {
                   category: { type: ["string", "null"] },
                   subItem: { type: ["string", "null"] },
                   company: { type: ["string", "null"] },
-                  url: { type: ["string", "null"] }
+                  url: { type: ["string", "null"] },
+                  projectName: { type: ["string", "null"] }
                 },
                 required: ["id", "name", "status", "priority", "sp", "due"]
               }

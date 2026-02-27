@@ -158,3 +158,15 @@ export async function chatPostMessage(
   return { ts: data.ts, channel: data.channel };
 }
 
+export async function chatUpdate(
+  token: string,
+  channel: string,
+  ts: string,
+  text: string,
+  blocks?: unknown[]
+): Promise<void> {
+  const body: Record<string, unknown> = { channel, ts, text };
+  if (blocks) body.blocks = blocks;
+  await slackApiCall(token, "chat.update", body);
+}
+

@@ -36,6 +36,7 @@ import {
 } from "./index";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import type { AllocationProposal, NewTask, MentionContext } from "./schema";
+import { buildApprovalButtons } from "./slackInteractions";
 
 // ── HMAC-SHA256 signature verification ────────────────────────────────────
 
@@ -68,7 +69,7 @@ async function verifySlackSignature(
 
 // ── Execute a Notion task creation ──────────────────────────────────────────
 
-async function executeTaskCreation(
+export async function executeTaskCreation(
   config: {
     notionToken: string;
     taskDbId?: string;
@@ -202,7 +203,7 @@ async function fetchChannelContext(
 
 // ── Step 9: Channel-wide completion notification ─────────────────────────
 
-async function sendCompletionNotification(
+export async function sendCompletionNotification(
   botToken: string,
   channel: string,
   results: string[],
@@ -226,7 +227,7 @@ async function sendCompletionNotification(
 
 // ── Execute a list of Notion update actions ────────────────────────────────
 
-async function executeNotionActions(
+export async function executeNotionActions(
   token: string,
   actions: Array<{
     action: string;
@@ -408,7 +409,7 @@ async function handleProjectSelectionReply(
     config.slackBotToken,
     channel,
     `${userMention}${responseText}`,
-    undefined,
+    buildApprovalButtons("task_action"),
     threadTs
   );
 
@@ -881,12 +882,12 @@ async function handleMention(
 
         console.log(`Asking for task description: "${result.new_tasks[0].task_name}", ts=${askMsg.ts}`);
       } else {
-        // Has description or multiple tasks — send confirmation, wait for ✅
+        // Has description or multiple tasks — send confirmation with buttons
         const confirmMsg = await chatPostMessage(
           config.slackBotToken,
           channel,
           `${userMention}${responseText}`,
-          undefined,
+          buildApprovalButtons("task_action"),
           threadTs
         );
 
@@ -920,12 +921,12 @@ async function handleMention(
         console.log(`Cleaned up old pending update: confirmMsgTs=${pendingCreateRef.confirmMsgTs}`);
       }
 
-      // Send confirmation message and save pending action
+      // Send confirmation message with buttons and save pending action
       const confirmMsg = await chatPostMessage(
         config.slackBotToken,
         channel,
         `${userMention}${result.response_text}`,
-        undefined,
+        buildApprovalButtons("task_action"),
         threadTs
       );
 
@@ -1420,7 +1421,7 @@ async function handlePmReply(
       config.slackBotToken,
       channel,
       confirmText,
-      undefined,
+      actions.actions.length > 0 ? buildApprovalButtons("task_action") : undefined,
       threadTs
     );
 

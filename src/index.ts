@@ -21,6 +21,7 @@ import {
   isCompletedStatus
 } from "./notionApi";
 import { handleSlackEvents } from "./slackEvents";
+import { handleSlackInteractions, buildPmReportButtons, buildEodReminderButtons } from "./slackInteractions";
 import { fetchMembers } from "./memberApi";
 import {
   analyzeTasksAndMembers,
@@ -114,10 +115,19 @@ function formatDeadlineTasksTable(
     Array<{ name: string; status: string; priority: string; sp: string; due: string }>
   >();
 
+  // Known project abbreviation overrides (Japanese names etc. that can't be auto-abbreviated)
+  const PROJECT_ABBREVIATION_OVERRIDES: ReadonlyMap<string, string> = new Map([
+    ["三井住友海上", "ms"],
+  ]);
+
   // Build project abbreviation cache
   const projectAbbrCache = new Map<string, string>();
   const abbreviateProject = (name: string): string => {
     if (projectAbbrCache.has(name)) return projectAbbrCache.get(name)!;
+    // Check explicit overrides first
+    for (const [pattern, abbr] of PROJECT_ABBREVIATION_OVERRIDES) {
+      if (name === pattern || name.startsWith(pattern)) { projectAbbrCache.set(name, abbr); return abbr; }
+    }
     // Short names (<=3 chars): use as-is
     if (name.length <= 3) { projectAbbrCache.set(name, name); return name; }
     // Extract uppercase letters from camelCase/PascalCase
@@ -1147,7 +1157,8 @@ async function runEveningFlow(
     const pmResult = await chatPostMessage(
       config.slackBotToken,
       channel,
-      pmReportText
+      pmReportText,
+      buildPmReportButtons()
     );
 
     // Save PM thread so Events API can route PM's reply (Step 8)
@@ -1289,7 +1300,7 @@ async function runEodReminderFlow(
         config.slackBotToken,
         thread.channel,
         `お疲れ様です！🌙 本日のタスクのステータスを更新しましょう！\n進捗があれば共有してください。`,
-        undefined,
+        buildEodReminderButtons(),
         thread.ts
       );
       reminded++;
@@ -1416,6 +1427,11 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
   if (path === "/slack/reaction" && request.method === "POST") {
     // Reaction events come via Events API; this endpoint is a convenience alias
     return handleSlackEvents(request, env, ctx);
+  }
+
+  // Slack Interactivity (button clicks, select menus, etc.)
+  if (path === "/slack/interactions" && request.method === "POST") {
+    return handleSlackInteractions(request, env, ctx);
   }
 
   if (path === "/run-now") {

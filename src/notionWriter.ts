@@ -159,22 +159,50 @@ export async function updateTaskPage(
   }
   if (updates.assignee !== undefined) {
     const userMap = await fetchNotionUserMap(token);
-    const notionUserId = userMap.get(updates.assignee);
+    let notionUserId = userMap.get(updates.assignee);
+
+    // Fallback: resolve from page's parent database if users.list doesn't have the user
+    if (!notionUserId && pageId) {
+      try {
+        const pageRes = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Notion-Version": NOTION_VERSION
+          }
+        });
+        if (pageRes.ok) {
+          const pageData = (await pageRes.json()) as { parent?: { type?: string; database_id?: string } };
+          if (pageData.parent?.type === "database_id" && pageData.parent.database_id) {
+            const dbUserMap = await buildUserMapFromDatabase(token, pageData.parent.database_id);
+            notionUserId = dbUserMap.get(updates.assignee);
+          }
+        }
+      } catch (err) {
+        console.warn(`Assignee fallback lookup failed: ${(err as Error).message}`);
+      }
+    }
+
     if (notionUserId) {
-      // Ready to activate — just remove the [NOT ACTIVE] guard below
-      console.log(
-        `[NOT ACTIVE] update_assignee: ${updates.assignee} → ${notionUserId} (page=${pageId})`
-      );
-      // properties["担当者"] = { people: [{ id: notionUserId }] };
+      properties["担当者"] = { people: [{ id: notionUserId }] };
     } else {
-      console.warn(
-        `[NOT ACTIVE] update_assignee: user "${updates.assignee}" not found in Notion`
-      );
+      console.warn(`update_assignee: user "${updates.assignee}" not found in Notion`);
     }
   }
 
   if (Object.keys(properties).length === 0) return;
   await patchPage(token, pageId, properties);
+}
+
+export async function updateTaskProject(
+  token: string,
+  pageId: string,
+  projectIds: string[],
+  relationProperty = "プロジェクト"
+): Promise<void> {
+  const relation = projectIds.map((id) => ({ id }));
+  await patchPage(token, pageId, {
+    [relationProperty]: { relation }
+  });
 }
 
 export async function updateTaskSprint(
@@ -195,8 +223,9 @@ export async function createTaskPage(
   token: string,
   databaseId: string,
   properties: Record<string, unknown>
-): Promise<string> {
+): Promise<{ id: string; url: string }> {
   let createdPageId = "";
+  let createdPageUrl = "";
   await withRetry(
     async () => {
       const res = await fetch("https://api.notion.com/v1/pages", {
@@ -214,11 +243,12 @@ export async function createTaskPage(
       }
       const data = (await res.json()) as { id?: string; url?: string };
       createdPageId = data.id ?? "";
+      createdPageUrl = data.url ?? "";
       console.log(`Notion page created: id=${data.id}, url=${data.url}`);
     },
     { label: "Notion createTaskPage" }
   );
-  return createdPageId;
+  return { id: createdPageId, url: createdPageUrl };
 }
 
 export async function appendPageContent(

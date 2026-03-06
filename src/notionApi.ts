@@ -1,6 +1,7 @@
 import { extractNotionIdFromUrl, type AppConfig } from "./config";
 import type { SprintTasksSummary } from "./schema";
 import { withRetry } from "./retry";
+import { toJstDateString } from "./workflow";
 
 const NOTION_VERSION = "2022-06-28";
 
@@ -197,7 +198,8 @@ const isDateInRange = (
 async function notionRequest(
   config: AppConfig,
   path: string,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  options?: { silent?: boolean }
 ): Promise<any> {
   return withRetry(
     async () => {
@@ -216,7 +218,7 @@ async function notionRequest(
       }
       return res.json();
     },
-    { label: `Notion ${path}` }
+    { label: `Notion ${path}`, silent: options?.silent }
   );
 }
 
@@ -224,7 +226,8 @@ async function queryDatabase(
   config: AppConfig,
   databaseId: string,
   body: Record<string, unknown>,
-  maxPages = 5
+  maxPages = 5,
+  options?: { silent?: boolean }
 ): Promise<any[]> {
   const results: any[] = [];
   let cursor: string | undefined;
@@ -239,7 +242,8 @@ async function queryDatabase(
     const data = await notionRequest(
       config,
       `databases/${databaseId}/query`,
-      payload
+      payload,
+      options
     );
     const items = Array.isArray(data.results) ? data.results : [];
     results.push(...items);
@@ -584,7 +588,7 @@ export async function fetchCurrentSprintTasksSummary(
     throw new Error("Sprint DB query returned no results");
   }
 
-  const today = now.toISOString().slice(0, 10);
+  const today = toJstDateString(now);
   const sprintCandidates = sprintPages
     .map((page) => extractSprintInfo(page, dateProp))
     .filter((sprint): sprint is SprintInfo => sprint != null);
@@ -760,7 +764,7 @@ export async function fetchSprintCapacity(
   if (!capacityDbId) {
     for (const db of childDbs) {
       try {
-        const sample = await queryDatabase(config, db.id, {}, 1);
+        const sample = await queryDatabase(config, db.id, {}, 1, { silent: true });
         if (sample.length === 0) continue;
         const props = Object.keys(sample[0]?.properties ?? {});
         const hasDayColumns = Object.keys(DAY_COLUMN_MAP).some((day) =>
@@ -778,7 +782,6 @@ export async function fetchSprintCapacity(
   }
 
   if (!capacityDbId) {
-    console.warn("Capacity child database not found in sprint page");
     return [];
   }
 

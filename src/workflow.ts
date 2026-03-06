@@ -42,7 +42,7 @@ export interface ActiveThread {
 
 export interface PendingNotionAction {
   actions: Array<{
-    action: "update_assignee" | "update_due" | "update_sp" | "update_status" | "update_sprint" | "create_task";
+    action: "update_assignee" | "update_due" | "update_sp" | "update_status" | "update_sprint" | "update_project" | "create_task";
     page_id: string;
     task_name: string;
     new_value: string;
@@ -54,10 +54,12 @@ export interface PendingNotionAction {
 
 const THREAD_KEY = (channel: string, ts: string) =>
   `thread:${channel}:${ts}`;
-const PM_THREAD_KEY = (date: string) => `pm-thread:${date}`;
+const PM_THREAD_KEY = (date: string, scope?: string) =>
+  scope ? `pm-thread:${scope}:${date}` : `pm-thread:${date}`;
 const REPLY_KEY = (channel: string, ts: string) =>
   `reply:${channel}:${ts}`;
-const ACTIVE_THREADS_KEY = (date: string) => `active-threads:${date}`;
+const ACTIVE_THREADS_KEY = (date: string, scope?: string) =>
+  scope ? `active-threads:${scope}:${date}` : `active-threads:${date}`;
 const PENDING_ACTION_KEY = (channel: string, ts: string) =>
   `pending-action:${channel}:${ts}`;
 const MENTION_HISTORY_KEY = (channel: string, threadTs: string) =>
@@ -91,18 +93,20 @@ export async function savePmThread(
   kv: KVNamespace,
   date: string,
   state: PmThreadState,
-  ttlSeconds = DEFAULT_TTL
+  ttlSeconds = DEFAULT_TTL,
+  scope?: string
 ): Promise<void> {
-  await kv.put(PM_THREAD_KEY(date), JSON.stringify(state), {
+  await kv.put(PM_THREAD_KEY(date, scope), JSON.stringify(state), {
     expirationTtl: ttlSeconds
   });
 }
 
 export async function getPmThread(
   kv: KVNamespace,
-  date: string
+  date: string,
+  scope?: string
 ): Promise<PmThreadState | null> {
-  const raw = await kv.get(PM_THREAD_KEY(date));
+  const raw = await kv.get(PM_THREAD_KEY(date, scope));
   if (!raw) return null;
   return JSON.parse(raw) as PmThreadState;
 }
@@ -135,9 +139,10 @@ export async function addActiveThread(
   kv: KVNamespace,
   date: string,
   entry: ActiveThread,
-  ttlSeconds = DEFAULT_TTL
+  ttlSeconds = DEFAULT_TTL,
+  scope?: string
 ): Promise<void> {
-  const key = ACTIVE_THREADS_KEY(date);
+  const key = ACTIVE_THREADS_KEY(date, scope);
   const existing = await kv.get(key);
   const threads: ActiveThread[] = existing ? JSON.parse(existing) : [];
   threads.push(entry);
@@ -146,9 +151,10 @@ export async function addActiveThread(
 
 export async function getActiveThreads(
   kv: KVNamespace,
-  date: string
+  date: string,
+  scope?: string
 ): Promise<ActiveThread[]> {
-  const raw = await kv.get(ACTIVE_THREADS_KEY(date));
+  const raw = await kv.get(ACTIVE_THREADS_KEY(date, scope));
   if (!raw) return [];
   return JSON.parse(raw) as ActiveThread[];
 }
@@ -322,14 +328,19 @@ export async function deletePendingCreateRef(
   await kv.delete(PENDING_CREATE_REF_KEY(channel, threadTs));
 }
 
-// ── Phone Reminder (☎️ reaction-based thread reminders) ─────────────────
+// ── Phone Reminder (☎️ reaction-based reminders with time selection) ─────
 
 export interface PhoneReminder {
   userId: string;
   channel: string;
   threadTs: string;
+  messageContent: string;
+  threadLink: string;
   createdAt: string;
-  lastRemindedAt: string;
+  remindAt: string;       // ISO timestamp or "" if time not yet selected
+  dmChannel: string;
+  initialDmTs: string;
+  status: "pending" | "fired";
 }
 
 const PHONE_REMINDER_KEY = (userId: string, channel: string, threadTs: string) =>
@@ -396,38 +407,57 @@ export async function listAllPhoneReminders(
   return reminders;
 }
 
-// ── Phone Reminder DM → Reminder mapping ────────────────────────────────
-// Maps a DM message (sent by the bot) back to the original phone reminder,
-// so reacting to the DM can stop the reminder.
+// ── Cron Heartbeat (health monitoring) ───────────────────────────────────
 
-const PHONE_REMINDER_DM_KEY = (dmChannel: string, dmTs: string) =>
-  `phone-reminder-dm:${dmChannel}:${dmTs}`;
+const CRON_HEARTBEAT_KEY = (name: string) => `cron-heartbeat:${name}`;
+const CRON_ALERT_KEY = (name: string, date: string) => `cron-alert:${name}:${date}`;
+const HEARTBEAT_TTL = 48 * 3600; // 48 hours
+const ALERT_TTL = 24 * 3600; // 24 hours
 
-export interface PhoneReminderDmRef {
-  userId: string;
-  channel: string;
-  threadTs: string;
-}
+const MONITORED_CRONS = ["morning", "evening", "snapshot", "reminder", "watchdog"] as const;
+export type CronName = (typeof MONITORED_CRONS)[number];
 
-export async function savePhoneReminderDm(
+export async function saveCronHeartbeat(
   kv: KVNamespace,
-  dmChannel: string,
-  dmTs: string,
-  ref: PhoneReminderDmRef
+  name: string
 ): Promise<void> {
-  await kv.put(
-    PHONE_REMINDER_DM_KEY(dmChannel, dmTs),
-    JSON.stringify(ref),
-    { expirationTtl: PHONE_REMINDER_TTL }
-  );
+  await kv.put(CRON_HEARTBEAT_KEY(name), new Date().toISOString(), {
+    expirationTtl: HEARTBEAT_TTL
+  });
 }
 
-export async function getPhoneReminderDm(
+export async function getCronHeartbeat(
   kv: KVNamespace,
-  dmChannel: string,
-  dmTs: string
-): Promise<PhoneReminderDmRef | null> {
-  const raw = await kv.get(PHONE_REMINDER_DM_KEY(dmChannel, dmTs));
-  if (!raw) return null;
-  return JSON.parse(raw) as PhoneReminderDmRef;
+  name: string
+): Promise<string | null> {
+  return kv.get(CRON_HEARTBEAT_KEY(name));
+}
+
+export async function getAllCronHeartbeats(
+  kv: KVNamespace
+): Promise<Record<string, string | null>> {
+  const result: Record<string, string | null> = {};
+  for (const name of MONITORED_CRONS) {
+    result[name] = await kv.get(CRON_HEARTBEAT_KEY(name));
+  }
+  return result;
+}
+
+export async function hasCronAlertBeenSent(
+  kv: KVNamespace,
+  name: string,
+  date: string
+): Promise<boolean> {
+  const val = await kv.get(CRON_ALERT_KEY(name, date));
+  return val !== null;
+}
+
+export async function markCronAlertSent(
+  kv: KVNamespace,
+  name: string,
+  date: string
+): Promise<void> {
+  await kv.put(CRON_ALERT_KEY(name, date), "1", {
+    expirationTtl: ALERT_TTL
+  });
 }

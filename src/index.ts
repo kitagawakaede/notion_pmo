@@ -1,4 +1,5 @@
 import { getConfig, type Bindings, type AppConfig } from "./config";
+import { listAllChannelConfigs, resolveConfig } from "./channelConfig";
 import { buildDedupKey, hashPayload, isDuplicateAndRemember } from "./dedupe";
 import { fetchSprintSummary, fetchFreeText, fetchSprintTasks } from "./notionMcp";
 import {
@@ -21,7 +22,7 @@ import {
   isCompletedStatus
 } from "./notionApi";
 import { handleSlackEvents } from "./slackEvents";
-import { handleSlackInteractions, buildPmReportButtons, buildEodReminderButtons } from "./slackInteractions";
+import { handleSlackInteractions, buildPmReportButtons, buildEodReminderButtons, buildReminderDeliveryButtons } from "./slackInteractions";
 import { fetchMembers } from "./memberApi";
 import {
   analyzeTasksAndMembers,
@@ -29,7 +30,7 @@ import {
   interpretRepliesAndPropose,
   matchTasksToSchedule
 } from "./llmAnalyzer";
-import { chatPostMessage, conversationsReplies, conversationsOpen } from "./slackBot";
+import { chatPostMessage, conversationsOpen } from "./slackBot";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import {
   saveThreadState,
@@ -41,8 +42,11 @@ import {
   toJstDateString,
   listAllPhoneReminders,
   savePhoneReminder,
-  deletePhoneReminder,
-  savePhoneReminderDm
+  saveCronHeartbeat,
+  getCronHeartbeat,
+  getAllCronHeartbeats,
+  hasCronAlertBeenSent,
+  markCronAlertSent
 } from "./workflow";
 
 interface Env extends Bindings {}
@@ -692,11 +696,13 @@ export async function calculateWeeklyDiff(
 async function runMorningFlow(
   env: Env,
   reason: string,
-  targetName?: string | null
+  targetName?: string | null,
+  channelId?: string
 ): Promise<Record<string, unknown>> {
   let config: AppConfig | undefined;
   try {
-    config = getConfig(env);
+    config = channelId ? await resolveConfig(env, channelId) : getConfig(env);
+    const targetChannel = channelId ?? config.slackPmoChannelId;
 
     if (!config.slackBotToken) {
       console.warn("SLACK_BOT_TOKEN not set; skipping morning flow");
@@ -707,11 +713,21 @@ async function runMorningFlow(
     const today = toJstDateString(now);
     const yesterdayKey = toJstDateString(now, -1);
 
+    // Dedup: skip if already run today (prevents double-execution from cron + catch-up race)
+    if (reason !== "manual") {
+      const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today, channelId);
+      if (activeThreads.length > 0) {
+        console.log(`Morning flow: already run today (${activeThreads.length} active threads), skipping (reason=${reason})`);
+        return { ok: true, skipped: true, reason: "already run today" };
+      }
+    }
+
     // Step 1: Fetch tasks and members
     const summary = await fetchCurrentSprintTasksSummary(config, now);
     const members = await fetchMembers(config);
 
     // Save current task snapshot for change detection
+    const snapshotScope = channelId ? `task-snapshot:${channelId}:` : `task-snapshot:`;
     const currentSnapshot = summary.assignees.flatMap((a) =>
       a.tasks.map((t) => ({
         id: t.id,
@@ -721,14 +737,14 @@ async function runMorningFlow(
       }))
     );
     await env.NOTIFY_CACHE.put(
-      `task-snapshot:${today}`,
+      `${snapshotScope}${today}`,
       JSON.stringify(currentSnapshot),
       { expirationTtl: config.dedupeTtlSeconds }
     );
 
     const previousSnapshot =
       ((await env.NOTIFY_CACHE.get(
-        `task-snapshot:${yesterdayKey}`,
+        `${snapshotScope}${yesterdayKey}`,
         "json"
       )) as typeof currentSnapshot | null) ?? [];
 
@@ -810,7 +826,7 @@ async function runMorningFlow(
     );
 
     // Step 4: Send messages via Slack Bot Token
-    const channel = config.slackPmoChannelId ?? "";
+    const channel = targetChannel ?? "";
     let sent = 0;
 
     if (!channel) {
@@ -879,12 +895,13 @@ async function runMorningFlow(
         channel: result.channel,
         ts: result.ts,
         assigneeName: msg.assignee_name
-      });
+      }, undefined, channelId);
 
       sent++;
     }
 
     console.log("Morning flow complete", { reason, sent });
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "morning");
     return { ok: true, reason, sent, dryRun: config.dryRun };
   } catch (error) {
     const err = error as Error;
@@ -896,11 +913,12 @@ async function runMorningFlow(
 /** Reminder flow: 09:00 JST = 00:00 UTC */
 async function runReminderFlow(
   env: Env,
-  reason: string
+  reason: string,
+  channelId?: string
 ): Promise<Record<string, unknown>> {
   let config: AppConfig | undefined;
   try {
-    config = getConfig(env);
+    config = channelId ? await resolveConfig(env, channelId) : getConfig(env);
 
     if (!config.slackBotToken) {
       console.warn("SLACK_BOT_TOKEN not set; skipping reminder flow");
@@ -908,7 +926,7 @@ async function runReminderFlow(
     }
 
     const today = toJstDateString();
-    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today);
+    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today, channelId);
     let reminded = 0;
 
     for (const thread of activeThreads) {
@@ -935,6 +953,7 @@ async function runReminderFlow(
     }
 
     console.log("Reminder flow complete", { reason, reminded });
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "reminder");
     return { ok: true, reason, reminded };
   } catch (error) {
     const err = error as Error;
@@ -946,11 +965,13 @@ async function runReminderFlow(
 /** PM report flow: Steps 6-7 (10:00 JST = 01:00 UTC) */
 async function runEveningFlow(
   env: Env,
-  reason: string
+  reason: string,
+  channelId?: string
 ): Promise<Record<string, unknown>> {
   let config: AppConfig | undefined;
   try {
-    config = getConfig(env);
+    config = channelId ? await resolveConfig(env, channelId) : getConfig(env);
+    const targetChannel = channelId ?? config.slackPmoChannelId;
 
     if (!config.slackBotToken) {
       console.warn("SLACK_BOT_TOKEN not set; skipping evening flow");
@@ -960,8 +981,18 @@ async function runEveningFlow(
     const now = new Date();
     const today = toJstDateString(now);
 
+    // Dedup: skip if PM thread already exists for today (prevents double PM report)
+    if (reason !== "manual") {
+      const existingPmThread = await getPmThread(env.NOTIFY_CACHE, today, channelId);
+      if (existingPmThread) {
+        console.log(`Evening flow: PM thread already exists for today (state=${existingPmThread.state}), skipping (reason=${reason})`);
+        return { ok: true, skipped: true, reason: "pm thread already exists" };
+      }
+    }
+
     // Collect replies from all active threads
-    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today);
+    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today, channelId);
+    console.log(`Evening flow: ${activeThreads.length} active threads for ${today}`);
     const replyMap = new Map<string, Awaited<ReturnType<typeof getReplies>>>();
 
     for (const thread of activeThreads) {
@@ -970,16 +1001,19 @@ async function runEveningFlow(
         thread.channel,
         thread.ts
       );
+      console.log(`  thread ${thread.assigneeName} (ts=${thread.ts}): ${replies.length} replies`);
       replyMap.set(thread.assigneeName, replies);
     }
+    console.log(`Evening flow: replyMap has ${replyMap.size} entries, total replies: ${Array.from(replyMap.values()).reduce((s, r) => s + r.length, 0)}`);
 
     // Refresh task summary and members for context
     const summary = await fetchCurrentSprintTasksSummary(config, now);
     const members = await fetchMembers(config);
 
+    const eveningSnapshotScope = channelId ? `task-snapshot:${channelId}:` : `task-snapshot:`;
     const previousSnapshot =
       ((await env.NOTIFY_CACHE.get(
-        `task-snapshot:${today}`,
+        `${eveningSnapshotScope}${today}`,
         "json"
       )) as Array<{
         id: string;
@@ -1140,7 +1174,7 @@ async function runEveningFlow(
     }
 
     // Step 7: Send PM daily report to PMO channel (mention PM)
-    const channel = config.slackPmoChannelId ?? "";
+    const channel = targetChannel ?? "";
     if (!channel) {
       console.warn("SLACK_PMO_CHANNEL_ID not set; skipping PM report");
       return { ok: true, skipped: true, reason: "no pmo channel" };
@@ -1167,9 +1201,10 @@ async function runEveningFlow(
       ts: pmResult.ts,
       proposalJson: JSON.stringify(proposal),
       state: "pending"
-    });
+    }, undefined, channelId);
 
     console.log("Evening flow complete", { reason, pmThreadTs: pmResult.ts });
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "evening");
     return { ok: true, reason, pmThreadTs: pmResult.ts };
   } catch (error) {
     const err = error as Error;
@@ -1181,18 +1216,19 @@ async function runEveningFlow(
 /** PM reminder: hourly 11:00-19:00 JST = 02:00-10:00 UTC */
 async function runPmReminderFlow(
   env: Env,
-  reason: string
+  reason: string,
+  channelId?: string
 ): Promise<Record<string, unknown>> {
   let config: AppConfig | undefined;
   try {
-    config = getConfig(env);
+    config = channelId ? await resolveConfig(env, channelId) : getConfig(env);
 
     if (!config.slackBotToken) {
       return { ok: true, skipped: true, reason: "no bot token" };
     }
 
     const today = toJstDateString();
-    const pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    const pmThread = await getPmThread(env.NOTIFY_CACHE, today, channelId);
 
     if (!pmThread || pmThread.state !== "pending") {
       console.log("PM reminder: no pending PM thread for today");
@@ -1259,6 +1295,7 @@ async function runProgressSpSnapshot(
     }), { expirationTtl: config.dedupeTtlSeconds });
 
     console.log(`Progress SP snapshot saved: ${snapshotKey} = ${progressSp}`);
+    await saveCronHeartbeat(env.NOTIFY_CACHE, "snapshot");
     return { ok: true, reason, progressSp, date: today };
   } catch (error) {
     const err = error as Error;
@@ -1271,23 +1308,34 @@ async function runProgressSpSnapshot(
 
 async function runEodReminderFlow(
   env: Env,
-  reason: string
+  reason: string,
+  channelId?: string
 ): Promise<Record<string, unknown>> {
   let config: AppConfig | undefined;
   try {
-    config = getConfig(env);
+    config = channelId ? await resolveConfig(env, channelId) : getConfig(env);
 
     if (!config.slackBotToken) {
       return { ok: true, skipped: true, reason: "no bot token" };
     }
 
+    // EOD runs at JST midnight — toJstDateString() already returns the new day,
+    // but morning threads were saved under the previous day's date.
+    // Try today first (in case manually triggered during the day), then fall back to yesterday.
     const today = toJstDateString();
-    const activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today);
+    const yesterday = toJstDateString(new Date(), -1);
+    let activeThreads = await getActiveThreads(env.NOTIFY_CACHE, today, channelId);
+    let usedDate = today;
+    if (activeThreads.length === 0) {
+      activeThreads = await getActiveThreads(env.NOTIFY_CACHE, yesterday, channelId);
+      usedDate = yesterday;
+    }
 
     if (activeThreads.length === 0) {
-      console.log("EOD reminder: no active threads for today");
+      console.log(`EOD reminder: no active threads for ${today} or ${yesterday}`);
       return { ok: true, skipped: true, reason: "no active threads" };
     }
+    console.log(`EOD reminder: found ${activeThreads.length} active threads for ${usedDate}`);
 
     let reminded = 0;
     for (const thread of activeThreads) {
@@ -1336,65 +1384,35 @@ async function runPhoneReminderFlow(
   let sentCount = 0;
 
   for (const reminder of reminders) {
-    // Check if 1 hour has passed since last reminder
-    const lastReminded = new Date(reminder.lastRemindedAt);
-    const msSinceLastRemind = now.getTime() - lastReminded.getTime();
-    if (msSinceLastRemind < 60 * 60 * 1000) continue;
+    // Only fire reminders that have a scheduled time, are pending, and the time has passed
+    if (!reminder.remindAt || reminder.status !== "pending") continue;
+    const remindAt = new Date(reminder.remindAt);
+    if (now.getTime() < remindAt.getTime()) continue;
 
     try {
-      // Fetch only the reacted message (not full thread)
-      let messages: Awaited<ReturnType<typeof conversationsReplies>> = [];
-      try {
-        messages = await conversationsReplies(
-          config.slackBotToken,
-          reminder.channel,
-          reminder.threadTs,
-          1,
-          true
-        );
-        if (messages.length > 1) messages = [messages[0]];
-      } catch {
-        // thread_not_found — likely a thread reply; will send link-only
-      }
+      const dmText =
+        `☎️ *メッセージリマインド*\n` +
+        `<${reminder.threadLink}|メッセージを見る>\n\n` +
+        (reminder.messageContent ? `───────────────\n${reminder.messageContent}\n───────────────\n\n` : "") +
+        `_再度リマインドしたい場合は時間を選択してください。_`;
 
-      const threadLink = `https://slack.com/archives/${reminder.channel}/p${reminder.threadTs.replace(".", "")}`;
-
-      let dmText: string;
-      if (messages.length > 0) {
-        const msgContent = `<@${messages[0].user}>: ${messages[0].text}`;
-        dmText =
-          `☎️ *メッセージリマインド*\n` +
-          `<${threadLink}|メッセージを見る>\n\n` +
-          `───────────────\n` +
-          `${msgContent}\n` +
-          `───────────────\n` +
-          `_このメッセージにスタンプを付けるとリマインドを停止します。_`;
-      } else {
-        dmText =
-          `☎️ *メッセージリマインド*\n` +
-          `<${threadLink}|メッセージを見る>\n\n` +
-          `_このメッセージにスタンプを付けるとリマインドを停止します。_`;
-      }
-
-      const dmChannelId = await conversationsOpen(config.slackBotToken, reminder.userId);
+      const dmChannelId = reminder.dmChannel || await conversationsOpen(config.slackBotToken, reminder.userId);
       if (!dmChannelId) continue;
 
-      const dmResult = await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
+      await chatPostMessage(
+        config.slackBotToken,
+        dmChannelId,
+        dmText,
+        [buildReminderDeliveryButtons(reminder.userId, reminder.channel, reminder.threadTs)]
+      );
 
-      // Save DM→reminder mapping so reacting to the DM can stop the reminder
-      await savePhoneReminderDm(env.NOTIFY_CACHE, dmChannelId, dmResult.ts, {
-        userId: reminder.userId,
-        channel: reminder.channel,
-        threadTs: reminder.threadTs
-      });
-
-      // Update lastRemindedAt
+      // Mark as fired (won't fire again until rescheduled)
       await savePhoneReminder(
         env.NOTIFY_CACHE,
         reminder.userId,
         reminder.channel,
         reminder.threadTs,
-        { ...reminder, lastRemindedAt: now.toISOString() }
+        { ...reminder, status: "fired" }
       );
 
       sentCount++;
@@ -1408,6 +1426,134 @@ async function runPhoneReminderFlow(
   return { ok: true, message: msg };
 }
 
+// ── Cron Health Check (watchdog) ────────────────────────────────────────────
+
+interface CronMonitorRule {
+  name: string;
+  checkStartJst: number;  // JST hour to start checking
+  checkEndJst: number;    // JST hour to stop checking
+  expectedJst: string;    // Display string for alert
+  manualEndpoint: string; // Manual trigger path
+}
+
+const CRON_MONITOR_RULES: CronMonitorRule[] = [
+  { name: "morning",  checkStartJst: 9,  checkEndJst: 10, expectedJst: "09:00", manualEndpoint: "/pmo/morning" },
+  { name: "evening",  checkStartJst: 10, checkEndJst: 11, expectedJst: "10:00", manualEndpoint: "/pmo/evening" },
+  { name: "snapshot", checkStartJst: 5,  checkEndJst: 6,  expectedJst: "05:00", manualEndpoint: "/pmo/progress-snapshot" },
+];
+
+async function runCronHealthCheck(env: Env): Promise<void> {
+  const config = getConfig(env);
+  if (!config.slackBotToken || !config.slackPmUserId) return;
+
+  const now = new Date();
+  const jstHour = (now.getUTCHours() + 9) % 24;
+  const jstMinute = now.getUTCMinutes();
+  const today = toJstDateString(now);
+
+  for (const rule of CRON_MONITOR_RULES) {
+    // Only check within the 30-min window after expected time
+    // e.g. morning (09:00): check at 09:30-09:45 (jstHour=9, minute>=30)
+    const inCheckWindow =
+      (jstHour === rule.checkStartJst && jstMinute >= 30) ||
+      (jstHour === rule.checkEndJst && jstMinute === 0);
+    if (!inCheckWindow) continue;
+
+    // Already alerted today?
+    if (await hasCronAlertBeenSent(env.NOTIFY_CACHE, rule.name, today)) continue;
+
+    // Check heartbeat
+    const heartbeat = await getCronHeartbeat(env.NOTIFY_CACHE, rule.name);
+    if (heartbeat) {
+      const heartbeatDate = toJstDateString(new Date(heartbeat));
+      if (heartbeatDate === today) continue; // Already ran today
+    }
+
+    // Alert: cron didn't fire today
+    const dmChannelId = await conversationsOpen(config.slackBotToken, config.slackPmUserId);
+    if (!dmChannelId) continue;
+
+    await chatPostMessage(
+      config.slackBotToken,
+      dmChannelId,
+      `⚠️ *cron 未実行アラート*\n` +
+      `\`${rule.name}\` が本日 ${rule.expectedJst} JST に実行されていません。\n` +
+      `手動実行: \`curl https://notion-sprint-worker.kaede-pmo.workers.dev${rule.manualEndpoint}\``
+    );
+
+    await markCronAlertSent(env.NOTIFY_CACHE, rule.name, today);
+    console.log(`Cron health alert sent: ${rule.name} missing for ${today}`);
+  }
+}
+
+// ── Missed cron catch-up ──────────────────────────────────────────────────
+// When crons resume after a Cloudflare outage, automatically re-run missed flows.
+
+async function runMissedCronCatchup(env: Env): Promise<void> {
+  try {
+    const now = new Date();
+    const today = toJstDateString(now);
+    const jstHour = (now.getUTCHours() + 9) % 24;
+    const jstMinute = now.getUTCMinutes();
+    // Combined JST time for range checks (e.g. 9.5 = 09:30)
+    const jstTime = jstHour + jstMinute / 60;
+
+    const isFromToday = (hb: string | null): boolean => {
+      if (!hb) return false;
+      return toJstDateString(new Date(hb)) === today;
+    };
+
+    // Prevent double catch-up per day per flow
+    const tryCatchup = async (name: string): Promise<boolean> => {
+      const key = `cron-catchup:${name}:${today}`;
+      if (await env.NOTIFY_CACHE.get(key)) return false;
+      await env.NOTIFY_CACHE.put(key, new Date().toISOString(), { expirationTtl: 86400 });
+      return true;
+    };
+
+    // Snapshot (expected 05:00 JST, catch up 05:30–09:00)
+    // 30min buffer avoids racing with the normal 05:00 cron
+    if (jstTime >= 5.5 && jstHour < 9) {
+      const hb = await getCronHeartbeat(env.NOTIFY_CACHE, "snapshot");
+      if (!isFromToday(hb) && await tryCatchup("snapshot")) {
+        console.log("Catch-up: snapshot missed, running now");
+        await runProgressSpSnapshot(env, "catchup");
+        return; // one catch-up per cycle
+      }
+    }
+
+    // Morning (expected 09:00 JST, catch up 09:30–13:00)
+    // 30min buffer avoids racing with the normal 09:00 cron
+    if (jstTime >= 9.5 && jstHour < 13) {
+      const hb = await getCronHeartbeat(env.NOTIFY_CACHE, "morning");
+      if (!isFromToday(hb) && await tryCatchup("morning")) {
+        console.log("Catch-up: morning flow missed, running now");
+        await runForAllChannels(env, (ch) => runMorningFlow(env, "catchup", null, ch));
+        return;
+      }
+    }
+
+    // Evening (expected 10:00 JST, catch up 10:30–16:00)
+    // 30min buffer + dependency: morning must have run today + at least 30 min ago
+    if (jstTime >= 10.5 && jstHour < 16) {
+      const morningHb = await getCronHeartbeat(env.NOTIFY_CACHE, "morning");
+      const eveningHb = await getCronHeartbeat(env.NOTIFY_CACHE, "evening");
+      if (isFromToday(morningHb) && !isFromToday(eveningHb)) {
+        const morningTime = new Date(morningHb!);
+        if (now.getTime() - morningTime.getTime() >= 30 * 60 * 1000) {
+          if (await tryCatchup("evening")) {
+            console.log("Catch-up: evening flow missed, running now");
+            await runForAllChannels(env, (ch) => runEveningFlow(env, "catchup", ch));
+            return;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Catch-up check failed:", (err as Error).message);
+  }
+}
+
 // ── HTTP handler ───────────────────────────────────────────────────────────
 
 async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
@@ -1415,7 +1561,56 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
   const path = url.pathname;
 
   if (path === "/health") {
-    return jsonResponse({ status: "ok" });
+    const heartbeats = await getAllCronHeartbeats(env.NOTIFY_CACHE);
+    return jsonResponse({ status: "ok", crons: heartbeats });
+  }
+
+  // Admin: send PM report to a specific user's DM (for testing)
+  if (path === "/pmo/pm-test") {
+    const targetUserId = url.searchParams.get("user");
+    if (!targetUserId) {
+      return jsonResponse({ ok: false, message: "?user=U... required" });
+    }
+    const cfg = getConfig(env);
+    if (!cfg.slackBotToken) return jsonResponse({ ok: false, message: "no bot token" });
+
+    const today = toJstDateString();
+    const pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    if (!pmThread) {
+      return jsonResponse({ ok: false, message: "no pm thread for today. Run /pmo/evening first" });
+    }
+
+    const dmChannelId = await conversationsOpen(cfg.slackBotToken, targetUserId);
+    if (!dmChannelId) return jsonResponse({ ok: false, message: "failed to open DM" });
+
+    const proposal = JSON.parse(pmThread.proposalJson);
+    const pmResult = await chatPostMessage(
+      cfg.slackBotToken,
+      dmChannelId,
+      proposal.pm_report ?? "PM report test",
+      buildPmReportButtons()
+    );
+
+    // Save PM thread with the DM's ts so the OK button works
+    await savePmThread(env.NOTIFY_CACHE, today, {
+      channel: dmChannelId,
+      ts: pmResult.ts,
+      proposalJson: pmThread.proposalJson,
+      state: "pending"
+    });
+
+    return jsonResponse({ ok: true, dmChannel: dmChannelId, ts: pmResult.ts });
+  }
+
+  // Admin: mark today's PM thread as processed (stop reminders)
+  if (path === "/pmo/pm-dismiss") {
+    const today = toJstDateString();
+    const pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    if (!pmThread) {
+      return jsonResponse({ ok: false, message: "no pm thread for today" });
+    }
+    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
+    return jsonResponse({ ok: true, message: "pm thread marked as processed" });
   }
 
   // Slack Events API
@@ -1630,6 +1825,34 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
   return jsonResponse({ message: "not found" }, 404);
 }
 
+async function runForAllChannels(
+  env: Env,
+  fn: (channelId?: string) => Promise<unknown>
+): Promise<void> {
+  // Run for all registered channels
+  const channels = await listAllChannelConfigs(env.NOTIFY_CACHE);
+  for (const { channelId } of channels) {
+    try {
+      await fn(channelId);
+    } catch (err) {
+      console.error(`Cron failed for channel ${channelId}:`, err);
+    }
+  }
+  // Also run with global config if PMO channel is set (backward compat)
+  try {
+    const globalConfig = getConfig(env);
+    if (globalConfig.slackPmoChannelId) {
+      // Only run global if it's not already covered by a registered channel
+      const registeredIds = channels.map((c) => c.channelId);
+      if (!registeredIds.includes(globalConfig.slackPmoChannelId)) {
+        await fn(undefined);
+      }
+    }
+  } catch {
+    // Global config may be incomplete (no DB URLs) - that's fine
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     return handleHttp(request, env, ctx);
@@ -1641,25 +1864,31 @@ export default {
       ctx.waitUntil(runProgressSpSnapshot(env, "cron"));
     } else if (event.cron === "0 0 * * *") {
       // 09:00 JST — Member notification
-      ctx.waitUntil(runMorningFlow(env, "cron"));
+      ctx.waitUntil(runForAllChannels(env, (ch) => runMorningFlow(env, "cron", null, ch)));
     } else if (event.cron === "10,20,30,40,50 0 * * *") {
       // 09:10-09:50 JST — Member reminder (every 10 min)
-      ctx.waitUntil(runReminderFlow(env, "cron"));
+      ctx.waitUntil(runForAllChannels(env, (ch) => runReminderFlow(env, "cron", ch)));
     } else if (event.cron === "0 1 * * *") {
       // 10:00 JST — PM report (Steps 6-7)
-      ctx.waitUntil(runEveningFlow(env, "cron"));
+      ctx.waitUntil(runForAllChannels(env, (ch) => runEveningFlow(env, "cron", ch)));
     } else if (event.cron === "0,15 * * * *") {
       // Every hour at :00 and :15 — combined trigger
+      // Watchdog heartbeat
+      ctx.waitUntil(saveCronHeartbeat(env.NOTIFY_CACHE, "watchdog"));
+      // Cron health check
+      ctx.waitUntil(runCronHealthCheck(env));
       // ☎️ Phone reminder: always (24h)
       ctx.waitUntil(runPhoneReminderFlow(env, "cron"));
       // PM reminder & EOD: time-gated by JST hour
       const jstHour = (new Date().getUTCHours() + 9) % 24;
       if (jstHour >= 11 && jstHour <= 19) {
-        ctx.waitUntil(runPmReminderFlow(env, "cron"));
+        ctx.waitUntil(runForAllChannels(env, (ch) => runPmReminderFlow(env, "cron", ch)));
       }
       if (jstHour === 0) {
-        ctx.waitUntil(runEodReminderFlow(env, "cron"));
+        ctx.waitUntil(runForAllChannels(env, (ch) => runEodReminderFlow(env, "cron", ch)));
       }
+      // Catch-up: re-trigger missed cron flows when crons resume after outage
+      ctx.waitUntil(runMissedCronCatchup(env));
     } else {
       // Fallback: legacy reports
       ctx.waitUntil(runReport(env, "cron"));

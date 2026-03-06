@@ -148,7 +148,14 @@ export async function chatPostMessage(
   threadTs?: string
 ): Promise<PostMessageResult> {
   const body: Record<string, unknown> = { channel, text };
-  if (blocks) body.blocks = blocks;
+  if (blocks) {
+    // Prepend text as a section block so it's visible alongside buttons
+    const textBlock = {
+      type: "section",
+      text: { type: "mrkdwn", text }
+    };
+    body.blocks = [textBlock, ...blocks];
+  }
   if (threadTs) body.thread_ts = threadTs;
 
   const data = (await slackApiCall(token, "chat.postMessage", body)) as {
@@ -168,5 +175,53 @@ export async function chatUpdate(
   const body: Record<string, unknown> = { channel, ts, text };
   if (blocks) body.blocks = blocks;
   await slackApiCall(token, "chat.update", body);
+}
+
+export async function viewsOpen(
+  token: string,
+  triggerId: string,
+  view: unknown
+): Promise<void> {
+  await slackApiCall(token, "views.open", {
+    trigger_id: triggerId,
+    view
+  });
+}
+
+export async function conversationsMembers(
+  token: string,
+  channel: string
+): Promise<string[]> {
+  const data = (await slackApiCall(token, "conversations.members", {
+    channel,
+    limit: 200
+  })) as { members?: string[] };
+  return data.members ?? [];
+}
+
+export async function usersInfo(
+  token: string,
+  userId: string
+): Promise<{ realName: string; displayName: string }> {
+  const data = (await slackApiCall(token, "users.info", {
+    user: userId
+  })) as { user?: { real_name?: string; profile?: { display_name?: string } } };
+  return {
+    realName: data.user?.real_name ?? "",
+    displayName: data.user?.profile?.display_name ?? ""
+  };
+}
+
+export async function authTest(
+  token: string
+): Promise<{ userId: string; botId: string }> {
+  const data = (await slackApiCall(token, "auth.test", {})) as {
+    user_id?: string;
+    bot_id?: string;
+  };
+  return {
+    userId: data.user_id ?? "",
+    botId: data.bot_id ?? ""
+  };
 }
 

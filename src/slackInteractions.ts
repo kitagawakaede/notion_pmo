@@ -1,5 +1,6 @@
 import type { Bindings } from "./config";
 import { getConfig } from "./config";
+import { resolveConfig } from "./channelConfig";
 import { chatPostMessage, chatUpdate, conversationsOpen, conversationsReplies } from "./slackBot";
 import {
   getPendingAction,
@@ -11,7 +12,9 @@ import {
   saveThreadState,
   toJstDateString,
   appendReply,
-  savePhoneReminder
+  savePhoneReminder,
+  getPhoneReminder,
+  deletePhoneReminder
 } from "./workflow";
 import {
   executeNotionActions,
@@ -128,6 +131,51 @@ export function buildEodReminderButtons(): unknown[] {
   ];
 }
 
+/** Build time selection buttons for phone reminder */
+export function buildTimeSelectionButtons(
+  userId: string,
+  channel: string,
+  threadTs: string
+): unknown {
+  return {
+    type: "actions",
+    block_id: "phone_time_select",
+    elements: [1, 3, 6, 24].map(h => ({
+      type: "button",
+      text: { type: "plain_text", text: `${h}時間`, emoji: true },
+      action_id: `phone_reminder_schedule_${h}`,
+      value: JSON.stringify({ hours: h, userId, channel, threadTs })
+    }))
+  };
+}
+
+/** Build reminder delivery buttons (stop + reschedule) */
+export function buildReminderDeliveryButtons(
+  userId: string,
+  channel: string,
+  threadTs: string
+): unknown {
+  return {
+    type: "actions",
+    block_id: "phone_reminder_actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "リマインド終了", emoji: true },
+        style: "danger",
+        action_id: "phone_reminder_stop",
+        value: JSON.stringify({ userId, channel, threadTs })
+      },
+      ...[1, 3, 6, 24].map(h => ({
+        type: "button",
+        text: { type: "plain_text", text: `${h}時間`, emoji: true },
+        action_id: `phone_reminder_schedule_${h}`,
+        value: JSON.stringify({ hours: h, userId, channel, threadTs })
+      }))
+    ]
+  };
+}
+
 /** Build a text section block from text */
 function textSection(text: string): unknown {
   return {
@@ -224,6 +272,11 @@ export async function handleSlackInteractions(
     return new Response("ok");
   }
 
+  // ── Modal submissions (view_submission) ─────────────────────────────────
+  if (payload.type === "view_submission") {
+    return new Response("ok");
+  }
+
   // ── Button clicks (block_actions) ──────────────────────────────────────
   if (payload.type !== "block_actions") {
     return new Response("ok");
@@ -234,19 +287,42 @@ export async function handleSlackInteractions(
 
   const actionId = action.action_id;
 
-  // Route to appropriate handler
+  // Determine the handler for this action
+  let handler: Promise<void> | null = null;
+
   if (actionId === "task_action_approve" || actionId === "task_action_cancel") {
-    await bg(handleTaskActionButton(env, payload, actionId === "task_action_approve"));
+    handler = handleTaskActionButton(env, payload, actionId === "task_action_approve");
   } else if (actionId === "task_action_modify") {
-    await bg(handleTaskModifyButton(env, payload));
+    handler = handleTaskModifyButton(env, payload);
   } else if (actionId === "pm_report_approve") {
-    await bg(handlePmReportButton(env, payload));
+    handler = handlePmReportButton(env, payload);
   } else if (actionId.startsWith("eod_")) {
-    await bg(handleEodButton(env, payload, actionId));
+    handler = handleEodButton(env, payload, actionId);
+  } else if (actionId.startsWith("phone_reminder_schedule")) {
+    handler = handleReminderScheduleButton(env, payload, action);
+  } else if (actionId === "phone_reminder_stop") {
+    handler = handleReminderStopButton(env, payload, action);
   }
 
-  // Return 200 immediately (Slack expects response within 3 seconds)
-  return new Response("ok");
+  if (!handler) {
+    return new Response("ok");
+  }
+
+  // Use TransformStream to keep Worker alive beyond 30s waitUntil limit
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const task = (async () => {
+    try {
+      await handler;
+    } catch (err) {
+      console.error("interaction handler failed:", err);
+    } finally {
+      await writer.write(new TextEncoder().encode("ok"));
+      await writer.close();
+    }
+  })();
+  if (ctx) ctx.waitUntil(task);
+  return new Response(readable, { status: 200 });
 }
 
 // ── Task/Update approval button handler ────────────────────────────────────
@@ -256,10 +332,9 @@ async function handleTaskActionButton(
   payload: SlackInteractionPayload,
   approved: boolean
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const messageTs = payload.message.ts;
   const threadTs = payload.message.thread_ts;
   const userId = payload.user.id;
@@ -410,10 +485,9 @@ async function handleTaskModifyButton(
   env: Bindings,
   payload: SlackInteractionPayload
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const messageTs = payload.message.ts;
   const threadTs = payload.message.thread_ts ?? messageTs;
   const userId = payload.user.id;
@@ -453,18 +527,26 @@ async function handlePmReportButton(
   env: Bindings,
   payload: SlackInteractionPayload
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const messageTs = payload.message.ts;
   const userId = payload.user.id;
 
   const today = toJstDateString();
-  const pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+  // Try channel-scoped PM thread first, then global (backward compat)
+  let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
+  if (!pmThread) pmThread = await getPmThread(env.NOTIFY_CACHE, today);
 
   if (!pmThread || pmThread.state !== "pending" || pmThread.channel !== channel || pmThread.ts !== messageTs) {
-    console.log(`PM report button click but no matching pending PM thread: channel=${channel} ts=${messageTs}`);
+    console.log(`PM report button mismatch: pmThread=${pmThread ? JSON.stringify({ state: pmThread.state, ts: pmThread.ts, channel: pmThread.channel }) : "null"}, clicked: channel=${channel} ts=${messageTs}, today=${today}`);
+    await chatPostMessage(
+      config.slackBotToken,
+      channel,
+      `⚠️ このボタンは既に処理済みか、有効期限が切れています。`,
+      undefined,
+      messageTs
+    );
     return;
   }
 
@@ -485,22 +567,30 @@ async function handlePmReportButton(
     config.dryRun
   );
 
-  await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
+  await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
 
-  const summaryMsg =
-    results.length > 0
-      ? `✅ Notion更新完了\n\n更新内容:\n${results.join("\n")}`
-      : "✅ 更新する内容がありませんでした。";
+  const summaryMsg = results.length > 0
+    ? `\n\nNotion更新完了:\n${results.join("\n")}`
+    : "";
 
   await chatUpdate(
     config.slackBotToken,
     channel,
     messageTs,
-    originalText + "\n\n" + summaryMsg,
+    originalText + summaryMsg,
     [
       ...blocksWithoutActions,
-      textSection(`✅ <@${userId}> がOKしました\n\n${summaryMsg}`)
+      textSection(`✅ <@${userId}> がOKしました${summaryMsg}`)
     ]
+  );
+
+  // Thread reply for visibility
+  await chatPostMessage(
+    config.slackBotToken,
+    channel,
+    `✅ <@${userId}> がOKしました${summaryMsg}`,
+    undefined,
+    messageTs
   );
 
   // Channel-wide completion notification
@@ -519,10 +609,9 @@ async function handleEodButton(
   payload: SlackInteractionPayload,
   actionId: string
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const messageTs = payload.message.ts;
   const threadTs = payload.message.thread_ts ?? messageTs;
   const userId = payload.user.id;
@@ -576,59 +665,165 @@ async function handleSetReminderShortcut(
   env: Bindings,
   payload: SlackInteractionPayload
 ): Promise<void> {
-  const config = getConfig(env);
+  const channel = payload.channel.id;
+  const config = await resolveConfig(env, channel);
   if (!config.slackBotToken) return;
 
   const userId = payload.user.id;
-  const channel = payload.channel.id;
   const messageTs = payload.message.ts;
-  // Use thread_ts if the message is in a thread, otherwise use the message itself
   const threadTs = payload.message.thread_ts ?? messageTs;
 
-  // Fetch thread content
-  const messages = await conversationsReplies(
-    config.slackBotToken,
-    channel,
-    threadTs,
-    100,
-    true
-  );
-
-  if (messages.length === 0) return;
-
-  const threadContent = messages
-    .map((m) => `<@${m.user}>: ${m.text}`)
-    .join("\n\n");
+  // Fetch the target message
+  let messages: Awaited<ReturnType<typeof conversationsReplies>> = [];
+  try {
+    messages = await conversationsReplies(config.slackBotToken, channel, threadTs, 1, true);
+    if (messages.length > 1) messages = [messages[0]];
+  } catch {
+    // thread_not_found — link-only
+  }
 
   const threadLink = `https://slack.com/archives/${channel}/p${threadTs.replace(".", "")}`;
+  const messageContent = messages.length > 0
+    ? `<@${messages[0].user}>: ${messages[0].text}`
+    : "";
 
   const dmText =
-    `☎️ *リマインド設定されたスレッド*\n` +
-    `<${threadLink}|スレッドを見る>\n\n` +
-    `───────────────\n` +
-    `${threadContent}\n` +
-    `───────────────\n` +
-    `_1時間ごとにリマインドします。解除するには ☎️ リアクションを外すか、「リマインド解除」と返信してください。_`;
+    `☎️ *リマインド設定されたメッセージ*\n` +
+    `<${threadLink}|メッセージを見る>\n\n` +
+    (messageContent ? `───────────────\n${messageContent}\n───────────────\n\n` : "") +
+    `_以下のボタンからリマインドまでの時間を選択してください。_`;
 
-  // Open DM channel with user
   const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
   if (!dmChannelId) {
     console.error(`Failed to open DM channel for user ${userId}`);
     return;
   }
 
-  // Send initial DM
-  await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
+  const dmResult = await chatPostMessage(
+    config.slackBotToken,
+    dmChannelId,
+    dmText,
+    [buildTimeSelectionButtons(userId, channel, threadTs)]
+  );
 
-  // Save reminder to KV (same as ☎️ reaction flow)
   const now = new Date().toISOString();
   await savePhoneReminder(env.NOTIFY_CACHE, userId, channel, threadTs, {
     userId,
     channel,
     threadTs,
+    messageContent,
+    threadLink,
     createdAt: now,
-    lastRemindedAt: now
+    remindAt: "",
+    dmChannel: dmChannelId,
+    initialDmTs: dmResult.ts,
+    status: "pending"
   });
 
   console.log(`Reminder set via shortcut: user=${userId}, channel=${channel}, threadTs=${threadTs}`);
+}
+
+// ── Phone reminder schedule button handler ──────────────────────────────────
+
+async function handleReminderScheduleButton(
+  env: Bindings,
+  payload: SlackInteractionPayload,
+  action: { value?: string }
+): Promise<void> {
+  const payloadChannel = payload.channel.id;
+  const config = await resolveConfig(env, payloadChannel);
+  if (!config.slackBotToken) return;
+
+  if (!action.value) return;
+  const { hours, userId, channel, threadTs } = JSON.parse(action.value) as {
+    hours: number;
+    userId: string;
+    channel: string;
+    threadTs: string;
+  };
+
+  const reminder = await getPhoneReminder(env.NOTIFY_CACHE, userId, channel, threadTs);
+  if (!reminder) {
+    console.log(`handleReminderScheduleButton: no reminder found for user=${userId}, threadTs=${threadTs}`);
+    const dmChannel = payload.channel.id;
+    const dmTs = payload.message.ts;
+    await chatUpdate(
+      config.slackBotToken,
+      dmChannel,
+      dmTs,
+      "⚠️ リマインダーが見つかりません。もう一度 ☎️ リアクションを付けてください。",
+      [textSection("⚠️ リマインダーが見つかりません。もう一度 ☎️ リアクションを付けてください。")]
+    );
+    return;
+  }
+
+  // Calculate remind time
+  const remindAt = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+
+  // Update KV
+  await savePhoneReminder(env.NOTIFY_CACHE, userId, channel, threadTs, {
+    ...reminder,
+    remindAt,
+    status: "pending"
+  });
+
+  // Build updated DM content
+  const dmText =
+    `☎️ *${hours}時間後にリマインドします！*\n` +
+    `<${reminder.threadLink}|メッセージを見る>\n\n` +
+    (reminder.messageContent ? `───────────────\n${reminder.messageContent}\n───────────────\n\n` : "") +
+    `_変更したい場合は以下のボタンから再度選択してください。_`;
+
+  // Update the DM message (replace buttons with new state)
+  const dmChannel = payload.channel.id;
+  const dmTs = payload.message.ts;
+
+  await chatUpdate(
+    config.slackBotToken,
+    dmChannel,
+    dmTs,
+    dmText,
+    [
+      textSection(dmText),
+      buildTimeSelectionButtons(userId, channel, threadTs)
+    ]
+  );
+
+  console.log(`Reminder scheduled: user=${userId}, hours=${hours}, remindAt=${remindAt}`);
+}
+
+// ── Phone reminder stop button handler ──────────────────────────────────────
+
+async function handleReminderStopButton(
+  env: Bindings,
+  payload: SlackInteractionPayload,
+  action: { value?: string }
+): Promise<void> {
+  const payloadChannel = payload.channel.id;
+  const config = await resolveConfig(env, payloadChannel);
+  if (!config.slackBotToken) return;
+
+  if (!action.value) return;
+  const { userId, channel, threadTs } = JSON.parse(action.value) as {
+    userId: string;
+    channel: string;
+    threadTs: string;
+  };
+
+  // Delete from KV
+  await deletePhoneReminder(env.NOTIFY_CACHE, userId, channel, threadTs);
+
+  // Update DM to show stopped state (remove buttons)
+  const dmChannel = payload.channel.id;
+  const dmTs = payload.message.ts;
+
+  await chatUpdate(
+    config.slackBotToken,
+    dmChannel,
+    dmTs,
+    "☎️ リマインドを終了しました。",
+    [textSection("☎️ リマインドを終了しました。")]
+  );
+
+  console.log(`Reminder stopped via button: user=${userId}, channel=${channel}, threadTs=${threadTs}`);
 }

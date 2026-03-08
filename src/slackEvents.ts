@@ -1,5 +1,6 @@
 import type { Bindings } from "./config";
 import { getConfig } from "./config";
+import { resolveConfig } from "./channelConfig";
 import {
   getThreadState,
   saveThreadState,
@@ -19,13 +20,11 @@ import {
   deletePendingCreateRef,
   toJstDateString,
   savePhoneReminder,
-  deletePhoneReminder,
-  savePhoneReminderDm,
-  getPhoneReminderDm
+  deletePhoneReminder
 } from "./workflow";
 import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen } from "./slackBot";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
-import { updateTaskPage, updateTaskSprint, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
+import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
 import { fetchCurrentSprintTasksSummary, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems } from "./notionApi";
 import { fetchMembers } from "./memberApi";
 import {
@@ -36,7 +35,7 @@ import {
 } from "./index";
 import { fetchScheduleData, analyzeScheduleDeviation } from "./sheetsApi";
 import type { AllocationProposal, NewTask, MentionContext } from "./schema";
-import { buildApprovalButtons } from "./slackInteractions";
+import { buildApprovalButtons, buildTimeSelectionButtons } from "./slackInteractions";
 
 // ── HMAC-SHA256 signature verification ────────────────────────────────────
 
@@ -143,9 +142,9 @@ export async function executeTaskCreation(
     return { message: `（DRY_RUN）タスク「${task.task_name}」を作成予定\n担当: ${assigneeNote}\n期限: ${task.due}\nSP: ${task.sp}` };
   }
 
-  let createdPageId: string | undefined;
+  let createdPage: { id: string; url: string } | undefined;
   try {
-    createdPageId = await createTaskPage(config.notionToken, config.taskDbId, properties);
+    createdPage = await createTaskPage(config.notionToken, config.taskDbId, properties);
   } catch (err) {
     console.error(`Failed to create task "${task.task_name}"`, (err as Error).message);
     return { message: `❌ タスク作成失敗: ${task.task_name}\nエラー: ${(err as Error).message}` };
@@ -155,9 +154,13 @@ export async function executeTaskCreation(
     ? task.assignee
     : `${task.assignee}（⚠️ Notion ユーザー未検出のため担当者未設定）`;
 
+  const taskLink = createdPage?.url
+    ? `<${createdPage.url}|${task.task_name}>`
+    : task.task_name;
+
   return {
-    message: `✅ タスク作成完了\n・タスク名: ${task.task_name}\n・担当: ${assigneeNote}\n・期限: ${task.due}\n・SP: ${task.sp}`,
-    pageId: createdPageId
+    message: `✅ タスク作成完了\n・タスク名: ${taskLink}\n・担当: ${assigneeNote}\n・期限: ${task.due}\n・SP: ${task.sp}`,
+    pageId: createdPage?.id
   };
 }
 
@@ -227,6 +230,10 @@ export async function sendCompletionNotification(
 
 // ── Execute a list of Notion update actions ────────────────────────────────
 
+function notionPageUrl(pageId: string): string {
+  return `https://www.notion.so/${pageId.replace(/-/g, "")}`;
+}
+
 export async function executeNotionActions(
   token: string,
   actions: Array<{
@@ -239,11 +246,32 @@ export async function executeNotionActions(
 ): Promise<string[]> {
   const results: string[] = [];
 
-  for (const action of actions) {
-    // update_assignee is implemented but not active yet — log only
+  // Deduplicate: keep only the last action per (page_id, action) pair
+  const seen = new Map<string, number>();
+  for (let i = 0; i < actions.length; i++) {
+    seen.set(`${actions[i].page_id}::${actions[i].action}`, i);
+  }
+  const deduped = actions.filter((_, i) => {
+    const a = actions[i];
+    return seen.get(`${a.page_id}::${a.action}`) === i;
+  });
+
+  for (const action of deduped) {
+    // update_assignee — change task assignee in Notion
     if (action.action === "update_assignee") {
-      console.log(`[NOT ACTIVE] update_assignee: ${action.task_name} → ${action.new_value}`);
-      results.push(`（未有効）${action.task_name}: 担当者変更 → ${action.new_value}`);
+      if (dryRun) {
+        console.log(`DRY_RUN: update_assignee ${action.task_name} → ${action.new_value}`);
+        results.push(`（DRY_RUN）${action.task_name}: 担当者変更 → ${action.new_value}`);
+        continue;
+      }
+      try {
+        await updateTaskPage(token, action.page_id, { assignee: action.new_value });
+        const link = notionPageUrl(action.page_id);
+        results.push(`・<${link}|${action.task_name}>: 担当者変更 → ${action.new_value}`);
+      } catch (err) {
+        console.error(`Failed to update assignee for ${action.page_id}`, (err as Error).message);
+        results.push(`・${action.task_name}: 担当者変更失敗 (${(err as Error).message})`);
+      }
       continue;
     }
 
@@ -258,10 +286,36 @@ export async function executeNotionActions(
       try {
         await updateTaskSprint(token, action.page_id, action.new_value);
         const label = action.new_value ? `スプリント移動` : "バックログ戻し";
-        results.push(`・${action.task_name}: ${label}`);
+        const link = notionPageUrl(action.page_id);
+        results.push(`・<${link}|${action.task_name}>: ${label}`);
       } catch (err) {
         console.error(`Failed to update sprint for ${action.page_id}`, (err as Error).message);
         results.push(`・${action.task_name}: スプリント移動失敗 (${(err as Error).message})`);
+      }
+      continue;
+    }
+
+    // update_project — change task's project relation in Notion
+    if (action.action === "update_project") {
+      if (dryRun) {
+        console.log(`DRY_RUN: update_project ${action.task_name} → ${action.new_value}`);
+        results.push(`（DRY_RUN）${action.task_name}: プロジェクト変更 → ${action.new_value}`);
+        continue;
+      }
+      try {
+        const candidates = await searchProjectsByName(token, action.new_value);
+        console.log(`update_project: search "${action.new_value}" → ${candidates.length} candidates: ${candidates.map(c => `${c.name}(${c.id.slice(0,8)})`).join(", ")}`);
+        if (candidates.length === 0) {
+          results.push(`・${action.task_name}: プロジェクト「${action.new_value}」が見つかりませんでした`);
+        } else {
+          console.log(`update_project: updating page ${action.page_id} with project ${candidates[0].id} (${candidates[0].name})`);
+          await updateTaskProject(token, action.page_id, [candidates[0].id]);
+          const link = notionPageUrl(action.page_id);
+          results.push(`・<${link}|${action.task_name}>: プロジェクト変更 → ${candidates[0].name}`);
+        }
+      } catch (err) {
+        console.error(`Failed to update project for ${action.page_id}:`, (err as Error).message);
+        results.push(`・${action.task_name}: プロジェクト変更失敗 (${(err as Error).message})`);
       }
       continue;
     }
@@ -288,7 +342,8 @@ export async function executeNotionActions(
 
     try {
       await updateTaskPage(token, action.page_id, updates);
-      results.push(`・${action.task_name}: ${action.action} → ${action.new_value}`);
+      const link = notionPageUrl(action.page_id);
+      results.push(`・<${link}|${action.task_name}>: ${action.action} → ${action.new_value}`);
     } catch (err) {
       console.error(`Failed to update task ${action.page_id}`, (err as Error).message);
       results.push(`・${action.task_name}: 更新失敗 (${(err as Error).message})`);
@@ -346,10 +401,9 @@ async function handleProjectSelectionReply(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<boolean> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return false;
-
   const channel = event.channel as string;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return false;
   const threadTs = event.thread_ts as string;
   const text = ((event.text as string) ?? "").replace(/<@[A-Z0-9]+>/g, "").trim();
   const userId = (event.user as string) ?? "";
@@ -444,10 +498,10 @@ async function handleMention(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
-  const config = getConfig(env);
+  const channel = event.channel as string;
+  const config = await resolveConfig(env, channel);
   if (!config.slackBotToken) return;
 
-  const channel = event.channel as string;
   const threadTs = (event.thread_ts as string | undefined) ?? (event.ts as string);
   const rawText = (event.text as string) ?? "";
   const userId = (event.user as string) ?? "";
@@ -457,6 +511,27 @@ async function handleMention(
 
   // Strip bot mention tokens like <@U12345>
   const userText = rawText.replace(/<@[A-Z0-9]+>/g, "").trim();
+
+  // ── 設定変更 command ──────────────────────────────────────────────────
+  if (userText === "設定変更" || userText === "settings") {
+    if (!config.slackBotToken) return;
+    await chatPostMessage(
+      config.slackBotToken,
+      channel,
+      "設定を変更します。下のボタンから設定画面を開いてください。",
+      [{
+        type: "actions",
+        block_id: "onboarding_setup",
+        elements: [{
+          type: "button",
+          text: { type: "plain_text", text: "設定変更", emoji: true },
+          style: "primary",
+          action_id: "onboarding_open_modal"
+        }]
+      }]
+    );
+    return;
+  }
 
   if (!userText) {
     await chatPostMessage(
@@ -782,7 +857,8 @@ async function handleMention(
           const candidates = await searchProjectsByName(config.notionToken, newTask.project);
 
           if (candidates.length === 0) {
-            projectDisplay = `${newTask.project}（⚠️ 未検出、既存プロジェクトを使用）`;
+            resolvedProjectIds = [];
+            projectDisplay = `${newTask.project}（⚠️ 未検出、プロジェクト未設定）`;
           } else if (candidates.length === 1) {
             resolvedProjectIds = [candidates[0].id];
             projectDisplay = candidates[0].name;
@@ -818,14 +894,29 @@ async function handleMention(
         let resolvedSprintId: string | undefined;
         let sprintDisplay: string | null = null;
         if (newTask.sprint) {
+          const sprintVal = newTask.sprint.trim();
+          const normalize = (s: string) => s.trim().toLowerCase().replace(/[\s\u3000]+/g, "");
           const matchedSprint = allSprints.find(
-            (s) => s.name === newTask.sprint || s.name.includes(newTask.sprint!) || newTask.sprint!.includes(s.name)
+            (s) =>
+              s.id === sprintVal ||
+              s.id.replace(/-/g, "") === sprintVal.replace(/-/g, "") ||
+              normalize(s.name) === normalize(sprintVal) ||
+              normalize(s.name).includes(normalize(sprintVal)) ||
+              normalize(sprintVal).includes(normalize(s.name))
           );
           if (matchedSprint) {
             resolvedSprintId = matchedSprint.id;
             sprintDisplay = matchedSprint.name;
           } else {
-            sprintDisplay = `${newTask.sprint}（⚠️ 未検出）`;
+            // Fallback: use current sprint if available
+            const currentSprint = allSprints.find((s) => s.id === summary.sprint.id);
+            if (currentSprint) {
+              resolvedSprintId = currentSprint.id;
+              sprintDisplay = `${currentSprint.name}（「${sprintVal}」→ 現スプリントに設定）`;
+              console.log(`Sprint fuzzy fallback: "${sprintVal}" → current sprint "${currentSprint.name}"`);
+            } else {
+              sprintDisplay = `${sprintVal}（⚠️ 未検出）`;
+            }
           }
         }
         // sprint が null → バックログ（sprintId なし）
@@ -921,11 +1012,23 @@ async function handleMention(
         console.log(`Cleaned up old pending update: confirmMsgTs=${pendingCreateRef.confirmMsgTs}`);
       }
 
+      // Resolve project names for update_project actions
+      let confirmText = result.response_text;
+      for (const act of result.actions) {
+        if (act.action === "update_project" && act.new_value) {
+          const candidates = await searchProjectsByName(config.notionToken, act.new_value);
+          if (candidates.length > 0 && candidates[0].name !== act.new_value) {
+            confirmText = confirmText.replaceAll(act.new_value, candidates[0].name);
+            act.new_value = candidates[0].name;
+          }
+        }
+      }
+
       // Send confirmation message with buttons and save pending action
       const confirmMsg = await chatPostMessage(
         config.slackBotToken,
         channel,
-        `${userMention}${result.response_text}`,
+        `${userMention}${confirmText}`,
         buildApprovalButtons("task_action"),
         threadTs
       );
@@ -982,79 +1085,77 @@ async function handlePhoneReaction(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const userId = event.user as string;
   const item = event.item as Record<string, unknown>;
   const channel = item.channel as string;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const messageTs = item.ts as string;
 
   console.log(`handlePhoneReaction: user=${userId}, channel=${channel}, messageTs=${messageTs}`);
 
-  // Fetch only the reacted message (not the full thread)
-  let messages: Awaited<ReturnType<typeof conversationsReplies>> = [];
   try {
-    messages = await conversationsReplies(
+    // Fetch only the reacted message (not the full thread)
+    let messages: Awaited<ReturnType<typeof conversationsReplies>> = [];
+    try {
+      messages = await conversationsReplies(
+        config.slackBotToken,
+        channel,
+        messageTs,
+        1,
+        true
+      );
+      if (messages.length > 1) messages = [messages[0]];
+    } catch {
+      console.log(`handlePhoneReaction: conversationsReplies failed for ${messageTs}, using link-only`);
+    }
+
+    const threadLink = `https://slack.com/archives/${channel}/p${messageTs.replace(".", "")}`;
+    const messageContent = messages.length > 0
+      ? `<@${messages[0].user}>: ${messages[0].text}`
+      : "";
+
+    const dmText =
+      `☎️ *リマインド設定されたメッセージ*\n` +
+      `<${threadLink}|メッセージを見る>\n\n` +
+      (messageContent ? `───────────────\n${messageContent}\n───────────────\n\n` : "") +
+      `_以下のボタンからリマインドまでの時間を選択してください。_`;
+
+    // Open DM channel with user
+    const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
+    if (!dmChannelId) {
+      console.error(`handlePhoneReaction: Failed to open DM channel for user ${userId}`);
+      return;
+    }
+
+    // Send DM with time selection buttons
+    const dmResult = await chatPostMessage(
       config.slackBotToken,
-      channel,
-      messageTs,
-      1,
-      true
+      dmChannelId,
+      dmText,
+      [buildTimeSelectionButtons(userId, channel, messageTs)]
     );
-    // Only keep the reacted message itself, not thread replies
-    if (messages.length > 1) messages = [messages[0]];
-  } catch {
-    // thread_not_found — likely a thread reply; content will be link-only
-    console.log(`handlePhoneReaction: conversationsReplies failed for ${messageTs}, using link-only`);
+    console.log(`handlePhoneReaction: DM sent to ${userId} in ${dmChannelId}, ts=${dmResult.ts}`);
+
+    // Save reminder to KV (new format)
+    const now = new Date().toISOString();
+    await savePhoneReminder(env.NOTIFY_CACHE, userId, channel, messageTs, {
+      userId,
+      channel,
+      threadTs: messageTs,
+      messageContent,
+      threadLink,
+      createdAt: now,
+      remindAt: "",
+      dmChannel: dmChannelId,
+      initialDmTs: dmResult.ts,
+      status: "pending"
+    });
+
+    console.log(`handlePhoneReaction: reminder saved, user=${userId}, channel=${channel}, threadTs=${messageTs}`);
+  } catch (err) {
+    console.error(`handlePhoneReaction failed: user=${userId}, channel=${channel}, messageTs=${messageTs}`, err);
   }
-
-  // Build permalink
-  const threadLink = `https://slack.com/archives/${channel}/p${messageTs.replace(".", "")}`;
-
-  let dmText: string;
-  if (messages.length > 0) {
-    const msgContent = `<@${messages[0].user}>: ${messages[0].text}`;
-    dmText =
-      `☎️ *リマインド設定されたメッセージ*\n` +
-      `<${threadLink}|メッセージを見る>\n\n` +
-      `───────────────\n` +
-      `${msgContent}\n` +
-      `───────────────\n` +
-      `_1時間ごとにリマインドします。このメッセージにスタンプを付けると停止します。_`;
-  } else {
-    dmText =
-      `☎️ *リマインド設定されたメッセージ*\n` +
-      `<${threadLink}|メッセージを見る>\n\n` +
-      `_1時間ごとにリマインドします。このメッセージにスタンプを付けると停止します。_`;
-  }
-
-  // Open DM channel with user
-  const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
-  if (!dmChannelId) {
-    console.error(`Failed to open DM channel for user ${userId}`);
-    return;
-  }
-
-  // Send initial DM
-  const dmResult = await chatPostMessage(config.slackBotToken, dmChannelId, dmText);
-
-  // Save reminder to KV
-  const now = new Date().toISOString();
-  await savePhoneReminder(env.NOTIFY_CACHE, userId, channel, messageTs, {
-    userId,
-    channel,
-    threadTs: messageTs,
-    createdAt: now,
-    lastRemindedAt: now
-  });
-
-  // Save DM→reminder mapping so reacting to the DM can stop the reminder
-  await savePhoneReminderDm(env.NOTIFY_CACHE, dmChannelId, dmResult.ts, {
-    userId, channel, threadTs: messageTs
-  });
-
-  console.log(`Phone reminder saved: user=${userId}, channel=${channel}, threadTs=${messageTs}`);
 }
 
 // ── Handle reaction_removed (cancel ☎️ reminder) ────────────────────────
@@ -1077,7 +1178,7 @@ async function handleReactionRemoved(
   console.log(`Phone reminder removed: user=${userId}, channel=${channel}, threadTs=${messageTs}`);
 
   // Notify user that reminder was cancelled
-  const config = getConfig(env);
+  const config = await resolveConfig(env, channel);
   if (config.slackBotToken) {
     const dmChannelId = await conversationsOpen(config.slackBotToken, userId);
     if (dmChannelId) {
@@ -1096,15 +1197,14 @@ async function handleReactionAdded(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const reaction = event.reaction as string;
 
   const item = event.item as Record<string, unknown> | undefined;
   if (!item || item.type !== "message") return;
 
   const channel = item.channel as string;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const messageTs = item.ts as string;
 
   console.log(`handleReactionAdded: reaction=${reaction}, channel=${channel}, messageTs=${messageTs}`);
@@ -1112,19 +1212,6 @@ async function handleReactionAdded(
   // ── ☎️ phone reaction → thread reminder DM ─────────────────────────────
   if (PHONE_REACTIONS.includes(reaction)) {
     await handlePhoneReaction(env, event);
-    return;
-  }
-
-  // ── Any reaction on a phone reminder DM → stop the reminder ───────────
-  const dmRef = await getPhoneReminderDm(env.NOTIFY_CACHE, channel, messageTs);
-  if (dmRef) {
-    await deletePhoneReminder(env.NOTIFY_CACHE, dmRef.userId, dmRef.channel, dmRef.threadTs);
-    await chatPostMessage(
-      config.slackBotToken,
-      channel,
-      "✅ リマインドを停止しました。"
-    );
-    console.log(`Phone reminder stopped via DM reaction: user=${dmRef.userId}, thread=${dmRef.threadTs}`);
     return;
   }
 
@@ -1137,7 +1224,9 @@ async function handleReactionAdded(
   if (!pending) {
     // Also check if this is a PM thread confirmation (Step 8)
     const today = toJstDateString();
-    const pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    // Try channel-scoped PM thread first, then global (backward compat)
+    let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
+    if (!pmThread) pmThread = await getPmThread(env.NOTIFY_CACHE, today);
     if (
       pmThread &&
       pmThread.state === "pending" &&
@@ -1155,7 +1244,7 @@ async function handleReactionAdded(
         config.dryRun
       );
 
-      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
+      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
 
       const summaryMsg =
         results.length > 0
@@ -1303,10 +1392,9 @@ async function handleAssigneeReply(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const channel = event.channel as string;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const threadTs = event.thread_ts as string;
   const text = (event.text as string) ?? "";
   const user = (event.user as string) ?? "";
@@ -1383,15 +1471,16 @@ async function handlePmReply(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
-  const config = getConfig(env);
-  if (!config.slackBotToken) return;
-
   const channel = event.channel as string;
+  const config = await resolveConfig(env, channel);
+  if (!config.slackBotToken) return;
   const threadTs = event.thread_ts as string;
   const text = (event.text as string) ?? "";
 
   const today = toJstDateString();
-  const pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+  // Try channel-scoped PM thread first, then global (backward compat)
+  let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
+  if (!pmThread) pmThread = await getPmThread(env.NOTIFY_CACHE, today);
 
   if (
     !pmThread ||
@@ -1434,7 +1523,7 @@ async function handlePmReply(
       });
     }
 
-    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
+    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
   } catch (err) {
     console.error("handlePmReply failed", (err as Error).message);
     await chatPostMessage(
@@ -1516,33 +1605,48 @@ export async function handleSlackEvents(
   const authorizations = payload.authorizations as Array<{ user_id: string }> | undefined;
   const botUserId = authorizations?.[0]?.user_id;
 
-  // Helper: run async work in background via ctx.waitUntil, or fall back to await
-  const bg = (work: Promise<void>) => {
-    if (ctx) {
-      ctx.waitUntil(work.catch((err) => console.error("bg task failed:", err)));
-    } else {
-      // No ctx (e.g. tests) — await inline
-      return work;
-    }
-    return Promise.resolve();
+  // Helper: run long-running work that survives past the Response.
+  // Uses a deferred Response pattern so that the fetch handler stays open
+  // (Cloudflare keeps the Worker alive as long as the Response hasn't been
+  // fully sent — we stream a delayed body to keep it open for up to 5 min).
+  const respondAndProcess = (work: (env: Bindings) => Promise<void>): Response => {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+
+    const task = (async () => {
+      try {
+        await work(env);
+      } catch (err) {
+        console.error("bg task failed:", err);
+      } finally {
+        // Write "ok" and close — Slack ignores the body for 200 responses
+        await writer.write(new TextEncoder().encode("ok"));
+        await writer.close();
+      }
+    })();
+
+    // ctx.waitUntil as a safety net (not the primary mechanism)
+    if (ctx) ctx.waitUntil(task);
+
+    return new Response(readable, {
+      status: 200,
+      headers: { "Content-Type": "text/plain" }
+    });
   };
 
   // ── reaction_added ──────────────────────────────────────────────────────
   if (eventType === "reaction_added") {
-    await bg(handleReactionAdded(env, event));
-    return new Response("ok");
+    return respondAndProcess(() => handleReactionAdded(env, event));
   }
 
   // ── reaction_removed (cancel ☎️ reminder) ──────────────────────────────
   if (eventType === "reaction_removed") {
-    await bg(handleReactionRemoved(env, event));
-    return new Response("ok");
+    return respondAndProcess(() => handleReactionRemoved(env, event));
   }
 
   // ── app_mention ─────────────────────────────────────────────────────────
   if (eventType === "app_mention" && !botId) {
-    await bg(handleMention(env, event));
-    return new Response("ok");
+    return respondAndProcess(() => handleMention(env, event));
   }
 
   // ── message (thread replies only, not from bots) ────────────────────────
@@ -1558,20 +1662,18 @@ export async function handleSlackEvents(
         : /<@[A-Z0-9]+>/.test(rawText); // fallback if authorizations unavailable
 
       if (!isBotMentioned) {
-        await bg((async () => {
+        return respondAndProcess(async () => {
           const handled = await handleProjectSelectionReply(env, event);
           if (!handled) {
             const createRef = await getPendingCreateRef(env.NOTIFY_CACHE, channel, threadTs);
             if (createRef) {
-              // Pending action exists — route to handleMention for modification
-              // (even if the text mentions other users like @assignee)
               await handleMention(env, event);
             } else {
               await handleAssigneeReply(env, event);
               await handlePmReply(env, event);
             }
           }
-        })());
+        });
       }
       // isBotMentioned === true → app_mention handler will process this
     }

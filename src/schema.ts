@@ -384,7 +384,7 @@ export const mentionIntentSchema = z.object({
   response_text: z.string(),
   actions: z.array(
     z.object({
-      action: z.enum(["update_assignee", "update_due", "update_sp", "update_status", "update_sprint"]),
+      action: z.enum(["update_assignee", "update_due", "update_sp", "update_status", "update_sprint", "update_project"]),
       page_id: z.string(),
       task_name: z.string(),
       new_value: z.string()
@@ -422,7 +422,7 @@ export const mentionIntentJsonSchema = {
           properties: {
             action: {
               type: "string",
-              enum: ["update_assignee", "update_due", "update_sp", "update_status", "update_sprint"]
+              enum: ["update_assignee", "update_due", "update_sp", "update_status", "update_sprint", "update_project"]
             },
             page_id: { type: "string" },
             task_name: { type: "string" },

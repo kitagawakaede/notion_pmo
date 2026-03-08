@@ -125,10 +125,6 @@ export function getConfig(env: Bindings): AppConfig {
   if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required");
   if (!env.NOTION_OAUTH_ACCESS_TOKEN)
     throw new Error("NOTION_OAUTH_ACCESS_TOKEN is required");
-  if (!env.SPRINT_DB_URL && !env.SPRINT_DB_NAME)
-    throw new Error("SPRINT_DB_URL or SPRINT_DB_NAME is required");
-  if (!env.TASK_DB_URL && !env.TASK_DB_NAME)
-    throw new Error("TASK_DB_URL or TASK_DB_NAME is required");
 
   const sprintDbId = extractNotionIdFromUrl(env.SPRINT_DB_URL);
   const taskDbId = extractNotionIdFromUrl(env.TASK_DB_URL);

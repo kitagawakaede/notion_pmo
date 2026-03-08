@@ -557,7 +557,7 @@ export async function interpretMention(
 - 以下の情報がコンテキストとして提供されています。質問に関連するデータを使って回答してください:
   - sprint_metrics: スプリント消化率（計画SP、進捗SP、残りSP、必要SP/日）
   - avg_daily_sp: 過去7日の平均日次消化SP（🟢🟡🔴判定に使用）
-  - members: メンバーの残り稼働時間(remainingHours)・合計稼働時間(totalHours)・1SPあたり必要時間(hoursPerSp)・現在のタスク数/SP・必要工数(requiredHours)・稼働率%(utilization) で空き状況を判断
+  - members: メンバーの残り稼働時間(remainingHours)・合計稼働時間(totalHours)・1SPあたり必要時間(hoursPerSp)・現在のタスク数/SP・必要工数(requiredHours)・稼働率%(utilization) で空き状況を判断。remainingHoursやtotalHoursがnullの場合はキャパシティ情報が未設定。その場合でも「登録してください」等とは言わず、利用可能なデータのみで回答する
   - schedule_deviation: スケジュール進捗（オンスケ/遅延/リスク件数・該当項目）
   - weekly_diff: 週次比較（7日間の完了タスク・新規タスク・SP合計）
   - stagnant_tasks: 2日以上ステータス変更のないDoingタスク
@@ -572,7 +572,7 @@ export async function interpretMention(
   対象タスク: 「{タスク名}」（担当: {担当者}、現在のステータス: {status}、期限: {due}、SP: {sp}）
   変更内容: {変更項目} {現在の値} → {新しい値}
   問題なければ ✅ をリアクションしてください
-- actionsに実行するNotion更新アクションを配列で返す
+- actionsに実行するNotion更新アクションを配列で返す。変更対象の項目のみ含める（変更しない項目のアクションは不要）
 - page_idはタスクリストに含まれるIDを必ず使用する（存在しないIDは使わない）
 - ユーザーの指示が曖昧で複数タスクに該当しうる場合は、候補を列挙してどのタスクか確認する（intent="query"、actionsは空）
 - new_tasksは空配列 []
@@ -581,6 +581,12 @@ export async function interpretMention(
 - action = "update_sprint"
 - new_valueにはavailable_sprintsのIDを使用する。バックログ戻しの場合はnew_value = ""（空文字）
 - response_textに確認メッセージを生成（対象タスクの詳細 + 移動先スプリント名を明記）
+- intent = "update"（updateとして扱う）
+
+**update_project（プロジェクト変更）**: タスクのプロジェクトリレーションを変更
+- action = "update_project"
+- new_valueにはプロジェクト名（日本語）を使用する（例: "三井住友海上"）
+- response_textに確認メッセージを生成（対象タスクの詳細 + 変更先プロジェクト名を明記）
 - intent = "update"（updateとして扱う）
 
 **create_task（タスク追加）**: 新しいタスクをNotionに追加するリクエスト
@@ -597,8 +603,8 @@ export async function interpretMention(
   - intent = "create_task"
   - response_textに確認メッセージを生成（全タスクの詳細を一覧表示 + 「✅ をリアクションしてください」）
   - response_textに📝概要は含めない（システム側で別途表示する）
-  - new_tasksに作成するタスク情報を配列でセット、各タスクのstatusは "Ready"
-  - descriptionは新規作成時はnull（システムが後から自動生成する）。thread_contextがある場合はスレッド内容から推測した概要をセット
+  - new_tasksに作成するタスク情報を配列でセット、各タスクのstatusはユーザーが指定しない限り "Backlog"
+  - descriptionは新規作成時はnull（システムが後から自動生成する）。thread_contextがある場合はスレッド内容からタスクの目的・背景・やるべきことだけを抽出して200字以内の概要をセット（「起票して」「担当を変更」「SPを○に」等のBot操作指示や、担当者名・期限・SP等のメタ情報は概要に含めない）
 - 必須項目が不足している場合:
   - intent = "create_task"
   - response_textに不足項目を質問するメッセージを生成（「タスク名と期限は分かりましたが、担当者とSPを教えてください！」）
@@ -633,10 +639,12 @@ export async function interpretMention(
 
 ■ 保留中の更新アクションの修正:
 - pending_update_actionsが提供されている場合、確認待ちの更新アクションが存在する
-- ユーザーが追加の変更を依頼した場合: 既存のアクションに新しいアクションを追加してactionsに全て含める
-- ユーザーが既存アクションの変更を依頼した場合: 該当アクションを修正版に置き換える
+- ⚠️ 重要: pending_update_actionsはまだNotionに適用されていない提案である。current_tasksの値が現在の実際の状態
+- ユーザーが「担当を○○に変更」等と言った場合: current_tasksの現在の値から○○への変更としてactionsを作る（pending_update_actionsのnew_valueを現在値として扱わない）
+- ユーザーが追加の変更を依頼した場合: pending_update_actionsを破棄し、ユーザーの新しい指示に基づいてactionsを作り直す
 - ユーザーがキャンセルを依頼した場合: intent="unknown"でキャンセル確認メッセージを返す
 - intent="update"で、修正後の全アクションをactionsに含め、response_textに更新内容一覧と「✅をリアクションしてください」を含める
+- response_textの「現在の担当者」等はcurrent_tasksの実際の値を使うこと
 
 ■ スレッドからのタスク自動起票:
 - thread_contextが提供されている場合、ユーザーはスレッド内の会話をもとにタスクを作成したいと考えている
@@ -701,6 +709,7 @@ export async function interpretMention(
 
 タスクリストに存在しないタスクへの更新指示の場合は、その旨をresponse_textに記載しintentをunknownにしてください。
 担当者変更の場合のnew_valueは担当者名（日本語）を使用してください。
+プロジェクト変更の場合のnew_valueはプロジェクト名（日本語）を使用してください。
 日付はYYYY-MM-DD形式で返してください。
 日本語で回答してください。`;
 
@@ -734,7 +743,8 @@ export async function interpretMention(
         status: t.status,
         sp: t.sp,
         due: t.due,
-        priority: t.priority
+        priority: t.priority,
+        projectName: t.projectName ?? null
       }))
     })),
     sprint_metrics: context.sprintMetrics,
@@ -812,10 +822,11 @@ export async function generateTaskDescription(
   const systemPrompt = `あなたはPMOアシスタントです。Slackチャンネル内のメッセージ一覧から、指定されたタスクに関連する情報を見つけ出し、タスクの概要を作成してください。
 
 ルール:
-・まずメッセージ一覧の中からタスクに関連しそうなものを意味的に判断して抽出する
-・部分一致だけでなく、タスクの目的・背景・技術領域などの意味合いで関連するものも拾う
-・関連メッセージが見つかったら、200字以内で概要を作成する（背景・目的・やるべきことが分かるように）
-・関連するメッセージが一つも見つからない場合のみ「null」とだけ返す
+・まずメッセージ一覧の中からタスクの内容・背景・目的に関連する情報だけを抽出する
+・「起票して」「担当を変更して」「SPを○にして」等のBot操作指示は概要に含めない
+・担当者名、期限、SP等のメタ情報は概要に含めない（それらは別途管理される）
+・タスクが実際に何をするのか（目的・背景・やるべきこと）だけを200字以内で概要にまとめる
+・タスク内容に関する具体的な情報が一つも見つからない場合は「null」とだけ返す
 ・日本語で記述する`;
 
   const userPrompt = `タスク名: ${taskName}

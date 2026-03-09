@@ -536,7 +536,11 @@ async function handlePmReportButton(
   const today = toJstDateString();
   // Try channel-scoped PM thread first, then global (backward compat)
   let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
-  if (!pmThread) pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+  let pmThreadScope: string | undefined = channel;
+  if (!pmThread) {
+    pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    pmThreadScope = undefined;
+  }
 
   if (!pmThread || pmThread.state !== "pending" || pmThread.channel !== channel || pmThread.ts !== messageTs) {
     console.log(`PM report button mismatch: pmThread=${pmThread ? JSON.stringify({ state: pmThread.state, ts: pmThread.ts, channel: pmThread.channel }) : "null"}, clicked: channel=${channel} ts=${messageTs}, today=${today}`);
@@ -556,6 +560,16 @@ async function handlePmReportButton(
     (b: unknown) => (b as Record<string, unknown>).type !== "actions"
   );
 
+  // Mark as processed FIRST to prevent reminder from firing during execution
+  // Save back to the SAME scope key we read from, so the reminder cron sees "processed"
+  await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, pmThreadScope);
+  // Also mark the other scope as processed in case reminder checks both
+  if (pmThreadScope === undefined) {
+    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
+  } else {
+    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, undefined);
+  }
+
   // Full approval
   const proposal = JSON.parse(pmThread.proposalJson) as AllocationProposal;
   const approvalText = "全提案を承認します";
@@ -566,8 +580,6 @@ async function handlePmReportButton(
     actions.actions,
     config.dryRun
   );
-
-  await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
 
   const summaryMsg = results.length > 0
     ? `\n\nNotion更新完了:\n${results.join("\n")}`

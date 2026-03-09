@@ -1235,6 +1235,14 @@ async function runPmReminderFlow(
       return { ok: true, skipped: true, reason: "no pending pm thread" };
     }
 
+    // Dedup: skip if reminder was already sent within the last 50 minutes
+    const reminderSentKey = `pm-reminder-sent:${channelId ?? "global"}:${today}`;
+    const lastSent = await env.NOTIFY_CACHE.get(reminderSentKey);
+    if (lastSent && reason !== "manual") {
+      console.log("PM reminder: already sent recently, skipping");
+      return { ok: true, skipped: true, reason: "already reminded recently" };
+    }
+
     const channel = pmThread.channel;
     const pmMention = config.slackPmUserId ? `<@${config.slackPmUserId}> ` : "";
 
@@ -1250,6 +1258,11 @@ async function runPmReminderFlow(
       undefined,
       pmThread.ts
     );
+
+    // Mark reminder as sent (TTL 50 min = skip :15 trigger, allow next hour's :00)
+    await env.NOTIFY_CACHE.put(reminderSentKey, new Date().toISOString(), {
+      expirationTtl: 50 * 60
+    });
 
     console.log("PM reminder sent", { reason, today });
     return { ok: true, reason, reminded: true };
@@ -1611,6 +1624,30 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     }
     await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
     return jsonResponse({ ok: true, message: "pm thread marked as processed" });
+  }
+
+  // Debug: inspect today's PM thread state
+  if (path === "/pmo/pm-debug") {
+    const today = toJstDateString();
+    const globalPm = await getPmThread(env.NOTIFY_CACHE, today);
+    const channels = await listAllChannelConfigs(env.NOTIFY_CACHE);
+    const channelPms: Record<string, unknown> = {};
+    for (const { channelId } of channels) {
+      const pm = await getPmThread(env.NOTIFY_CACHE, today, channelId);
+      if (pm) channelPms[channelId] = pm;
+    }
+    const globalConfig = getConfig(env);
+    const pmoChannelPm = globalConfig.slackPmoChannelId
+      ? await getPmThread(env.NOTIFY_CACHE, today, globalConfig.slackPmoChannelId)
+      : null;
+    return jsonResponse({
+      today,
+      globalPm,
+      pmoChannelPm,
+      channelPms,
+      registeredChannels: channels.length,
+      pmoChannelId: globalConfig.slackPmoChannelId
+    });
   }
 
   // Slack Events API

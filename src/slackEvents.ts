@@ -1226,7 +1226,11 @@ async function handleReactionAdded(
     const today = toJstDateString();
     // Try channel-scoped PM thread first, then global (backward compat)
     let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
-    if (!pmThread) pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    let pmThreadScope: string | undefined = channel;
+    if (!pmThread) {
+      pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+      pmThreadScope = undefined;
+    }
     if (
       pmThread &&
       pmThread.state === "pending" &&
@@ -1244,7 +1248,13 @@ async function handleReactionAdded(
         config.dryRun
       );
 
-      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
+      // Save back to the SAME scope key we read from + mark the other scope too
+      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, pmThreadScope);
+      if (pmThreadScope === undefined) {
+        await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
+      } else {
+        await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, undefined);
+      }
 
       const summaryMsg =
         results.length > 0
@@ -1480,7 +1490,11 @@ async function handlePmReply(
   const today = toJstDateString();
   // Try channel-scoped PM thread first, then global (backward compat)
   let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
-  if (!pmThread) pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+  let pmThreadScope: string | undefined = channel;
+  if (!pmThread) {
+    pmThread = await getPmThread(env.NOTIFY_CACHE, today);
+    pmThreadScope = undefined;
+  }
 
   if (
     !pmThread ||
@@ -1523,7 +1537,13 @@ async function handlePmReply(
       });
     }
 
-    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
+    // Save back to the SAME scope key we read from + mark the other scope too
+    await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, pmThreadScope);
+    if (pmThreadScope === undefined) {
+      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
+    } else {
+      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, undefined);
+    }
   } catch (err) {
     console.error("handlePmReply failed", (err as Error).message);
     await chatPostMessage(

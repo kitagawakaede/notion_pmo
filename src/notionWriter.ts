@@ -224,9 +224,7 @@ export async function createTaskPage(
   databaseId: string,
   properties: Record<string, unknown>
 ): Promise<{ id: string; url: string }> {
-  let createdPageId = "";
-  let createdPageUrl = "";
-  await withRetry(
+  return await withRetry(
     async () => {
       const res = await fetch("https://api.notion.com/v1/pages", {
         method: "POST",
@@ -242,13 +240,11 @@ export async function createTaskPage(
         throw new Error(`Notion create error: ${res.status} ${detail}`);
       }
       const data = (await res.json()) as { id?: string; url?: string };
-      createdPageId = data.id ?? "";
-      createdPageUrl = data.url ?? "";
       console.log(`Notion page created: id=${data.id}, url=${data.url}`);
+      return { id: data.id ?? "", url: data.url ?? "" };
     },
     { label: "Notion createTaskPage" }
   );
-  return { id: createdPageId, url: createdPageUrl };
 }
 
 export async function appendPageContent(
@@ -298,6 +294,73 @@ export async function appendPageContent(
   );
 }
 
+export async function appendLinksToPage(
+  token: string,
+  pageId: string,
+  threadUrl: string,
+  relevantUrls: string[]
+): Promise<void> {
+  const children: unknown[] = [
+    {
+      object: "block",
+      type: "heading_2",
+      heading_2: {
+        rich_text: [{ type: "text", text: { content: "Slackスレッド" } }]
+      }
+    },
+    {
+      object: "block",
+      type: "paragraph",
+      paragraph: {
+        rich_text: [{ type: "text", text: { content: threadUrl, link: { url: threadUrl } } }]
+      }
+    }
+  ];
+
+  if (relevantUrls.length > 0) {
+    children.push({
+      object: "block",
+      type: "heading_2",
+      heading_2: {
+        rich_text: [{ type: "text", text: { content: "関連資料" } }]
+      }
+    });
+    for (const url of relevantUrls) {
+      children.push({
+        object: "block",
+        type: "bulleted_list_item",
+        bulleted_list_item: {
+          rich_text: [{ type: "text", text: { content: url, link: { url } } }]
+        }
+      });
+    }
+  }
+
+  await withRetry(
+    async () => {
+      const res = await fetch(
+        `https://api.notion.com/v1/blocks/${pageId}/children`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ children })
+        }
+      );
+      if (!res.ok) {
+        const detail = await res.text();
+        throw new Error(
+          `Notion appendLinksToPage error [${pageId}]: ${res.status} ${detail}`
+        );
+      }
+    },
+    { label: `Notion appendLinksToPage ${pageId}` }
+  );
+}
+
 export interface ProjectCandidate {
   id: string;
   name: string;
@@ -308,7 +371,8 @@ export interface ProjectCandidate {
  */
 export async function searchProjectsByName(
   token: string,
-  projectName: string
+  projectName: string,
+  projectDbId?: string
 ): Promise<ProjectCandidate[]> {
   try {
     const res = await fetch("https://api.notion.com/v1/search", {
@@ -321,7 +385,7 @@ export async function searchProjectsByName(
       body: JSON.stringify({
         query: projectName,
         filter: { value: "page", property: "object" },
-        page_size: 10
+        page_size: 20
       })
     });
 
@@ -333,24 +397,47 @@ export async function searchProjectsByName(
     const data = (await res.json()) as {
       results: Array<{
         id: string;
+        parent?: { type: string; database_id?: string };
         properties?: Record<string, any>;
       }>;
     };
 
     const candidates: ProjectCandidate[] = [];
+    const normalizeProject = (s: string) => s.trim().toLowerCase().replace(/[\s\u3000]+/g, "");
+    const nQuery = normalizeProject(projectName);
+    // Normalize projectDbId for comparison (remove hyphens)
+    const nProjectDbId = projectDbId?.replace(/-/g, "");
+
     for (const page of data.results) {
+      // If projectDbId is configured, only accept pages from the project DB
+      if (nProjectDbId) {
+        const parentDbId = page.parent?.database_id?.replace(/-/g, "");
+        if (parentDbId !== nProjectDbId) continue;
+      }
+
       const props = page.properties ?? {};
       for (const prop of Object.values(props)) {
         if (prop?.type === "title" && Array.isArray(prop.title)) {
           const title = prop.title.map((t: any) => t.plain_text ?? "").join("");
-          if (title && (title.includes(projectName) || projectName.includes(title))) {
+          if (!title) continue;
+          const nTitle = normalizeProject(title);
+          if (nTitle === nQuery || nTitle.includes(nQuery) || nQuery.includes(nTitle)) {
             candidates.push({ id: page.id, name: title });
           }
         }
       }
     }
 
-    console.log(`Project search "${projectName}": ${candidates.length} candidates found`);
+    // Sort candidates: exact match first, then by name length similarity to query
+    candidates.sort((a, b) => {
+      const nA = normalizeProject(a.name);
+      const nB = normalizeProject(b.name);
+      if (nA === nQuery && nB !== nQuery) return -1;
+      if (nB === nQuery && nA !== nQuery) return 1;
+      return Math.abs(a.name.length - projectName.length) - Math.abs(b.name.length - projectName.length);
+    });
+
+    console.log(`Project search "${projectName}": ${candidates.length} candidates found (dbFilter=${!!nProjectDbId})${candidates.length > 0 ? ` (best: "${candidates[0].name}")` : ""}`);
     return candidates;
   } catch (err) {
     console.warn(`searchProjectsByName error: ${(err as Error).message}`);

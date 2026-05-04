@@ -363,7 +363,7 @@ const extractSprintInfo = (
 };
 
 /** Fetch page titles by IDs in batch (individual fetches, deduplicated) */
-async function fetchPageTitles(
+export async function fetchPageTitles(
   config: AppConfig,
   pageIds: string[]
 ): Promise<Map<string, string>> {

@@ -42,7 +42,7 @@ export interface ActiveThread {
 
 export interface PendingNotionAction {
   actions: Array<{
-    action: "update_assignee" | "update_due" | "update_sp" | "update_status" | "update_sprint" | "update_project" | "create_task";
+    action: "update_assignee" | "update_due" | "update_sp" | "update_status" | "update_sprint" | "update_project" | "create_task" | "append_description";
     page_id: string;
     task_name: string;
     new_value: string;
@@ -96,6 +96,10 @@ export async function savePmThread(
   ttlSeconds = DEFAULT_TTL,
   scope?: string
 ): Promise<void> {
+  if (state.state === "processed") {
+    const stack = new Error().stack ?? "";
+    console.log(`[PM-THREAD-PROCESSED] scope=${scope}, date=${date}, caller=${stack.split("\n").slice(1, 3).join(" <- ")}`);
+  }
   await kv.put(PM_THREAD_KEY(date, scope), JSON.stringify(state), {
     expirationTtl: ttlSeconds
   });

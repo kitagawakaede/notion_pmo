@@ -22,7 +22,7 @@ import {
   sendCompletionNotification
 } from "./slackEvents";
 import { interpretPmReply } from "./llmAnalyzer";
-import { fetchNotionUserMap, buildUserMapFromDatabase, appendPageContent } from "./notionWriter";
+import { fetchNotionUserMap, buildUserMapFromDatabase, appendPageContent, appendLinksToPage } from "./notionWriter";
 import type { AllocationProposal, NewTask } from "./schema";
 
 // ── HMAC-SHA256 signature verification (same as slackEvents) ───────────────
@@ -56,7 +56,7 @@ async function verifySlackSignature(
 
 // ── Block Kit button builders ──────────────────────────────────────────────
 
-/** Build an actions block with approve/modify/cancel buttons for task or update confirmation */
+/** Build an actions block with approve/cancel buttons for task or update confirmation */
 export function buildApprovalButtons(actionIdPrefix: string): unknown[] {
   return [
     {
@@ -68,11 +68,6 @@ export function buildApprovalButtons(actionIdPrefix: string): unknown[] {
           text: { type: "plain_text", text: "✅ 承認", emoji: true },
           style: "primary",
           action_id: `${actionIdPrefix}_approve`
-        },
-        {
-          type: "button",
-          text: { type: "plain_text", text: "✏️ 修正する", emoji: true },
-          action_id: `${actionIdPrefix}_modify`
         },
         {
           type: "button",
@@ -292,8 +287,6 @@ export async function handleSlackInteractions(
 
   if (actionId === "task_action_approve" || actionId === "task_action_cancel") {
     handler = handleTaskActionButton(env, payload, actionId === "task_action_approve");
-  } else if (actionId === "task_action_modify") {
-    handler = handleTaskModifyButton(env, payload);
   } else if (actionId === "pm_report_approve") {
     handler = handlePmReportButton(env, payload);
   } else if (actionId.startsWith("eod_")) {
@@ -389,6 +382,7 @@ async function handleTaskActionButton(
           projectIds?: string[];
           project?: string | null;
           description?: string;
+          relevantUrls?: string[];
         };
         const result = await executeTaskCreation(
           {
@@ -406,6 +400,16 @@ async function handleTaskActionButton(
             await appendPageContent(config.notionToken, result.pageId, newTask.description);
           } catch (err) {
             console.warn(`Failed to append description: ${(err as Error).message}`);
+          }
+        }
+
+        // Append Slack thread URL and relevant URLs to Notion page
+        if (result.pageId) {
+          const slackThreadUrl = `https://slack.com/archives/${channel}/p${(threadTs ?? messageTs).replace(".", "")}`;
+          try {
+            await appendLinksToPage(config.notionToken, result.pageId, slackThreadUrl, newTask.relevantUrls ?? []);
+          } catch (err) {
+            console.warn(`Failed to append links: ${(err as Error).message}`);
           }
         }
 
@@ -446,7 +450,8 @@ async function handleTaskActionButton(
     const results = await executeNotionActions(
       config.notionToken,
       pending.actions,
-      config.dryRun
+      config.dryRun,
+      config.projectDbId
     );
 
     await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
@@ -562,6 +567,7 @@ async function handlePmReportButton(
 
   // Mark as processed FIRST to prevent reminder from firing during execution
   // Save back to the SAME scope key we read from, so the reminder cron sees "processed"
+  console.log(`[PM-PROCESSED-BY] handlePmReportButton (OK button), scope=${pmThreadScope}, channel=${channel}, ts=${messageTs}`)
   await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, pmThreadScope);
   // Also mark the other scope as processed in case reminder checks both
   if (pmThreadScope === undefined) {
@@ -578,7 +584,8 @@ async function handlePmReportButton(
   const results = await executeNotionActions(
     config.notionToken,
     actions.actions,
-    config.dryRun
+    config.dryRun,
+    config.projectDbId
   );
 
   const summaryMsg = results.length > 0

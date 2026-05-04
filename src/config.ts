@@ -28,6 +28,7 @@ export interface Bindings {
   GOOGLE_SHEETS_API_KEY?: string;
   GOOGLE_SHEETS_RANGE?: string;
   REFERENCE_DB_URL?: string;
+  PROJECT_DB_ID?: string;
   DRY_RUN?: string;
   REQUIRE_APPROVAL?: string;
   NOTIFY_CACHE: KVNamespace;
@@ -62,6 +63,7 @@ export interface AppConfig {
   googleSheetsApiKey?: string;
   googleSheetsRange?: string;
   referenceDbId?: string;
+  projectDbId?: string;
   dryRun: boolean;
   requireApproval: "never" | "always";
   mcpServerUrl: string;
@@ -161,6 +163,7 @@ export function getConfig(env: Bindings): AppConfig {
     googleSheetsApiKey: env.GOOGLE_SHEETS_API_KEY,
     googleSheetsRange: env.GOOGLE_SHEETS_RANGE,
     referenceDbId,
+    projectDbId: env.PROJECT_DB_ID,
     dryRun: parseBool(env.DRY_RUN),
     requireApproval: env.REQUIRE_APPROVAL === "always" ? "always" : "never",
     mcpServerUrl: env.MCP_SERVER_URL || "https://mcp.notion.com/mcp",

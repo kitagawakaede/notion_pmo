@@ -149,12 +149,20 @@ export async function chatPostMessage(
 ): Promise<PostMessageResult> {
   const body: Record<string, unknown> = { channel, text };
   if (blocks) {
-    // Prepend text as a section block so it's visible alongside buttons
-    const textBlock = {
-      type: "section",
-      text: { type: "mrkdwn", text }
-    };
-    body.blocks = [textBlock, ...blocks];
+    // If blocks already contain section blocks (pre-built), use as-is.
+    // Otherwise, prepend text as a section block so it's visible alongside buttons.
+    const hasSection = blocks.some(
+      (b: unknown) => (b as Record<string, unknown>).type === "section"
+    );
+    if (hasSection) {
+      body.blocks = blocks;
+    } else {
+      const textBlock = {
+        type: "section",
+        text: { type: "mrkdwn", text }
+      };
+      body.blocks = [textBlock, ...blocks];
+    }
   }
   if (threadTs) body.thread_ts = threadTs;
 

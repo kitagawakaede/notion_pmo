@@ -25,7 +25,7 @@ import {
 import { chatPostMessage, conversationsHistory, conversationsReplies, conversationsOpen } from "./slackBot";
 import { interpretPmReply, interpretMention, evaluateAssigneeReply, generateTaskDescription } from "./llmAnalyzer";
 import { updateTaskPage, updateTaskSprint, updateTaskProject, createTaskPage, fetchNotionUserMap, buildUserMapFromDatabase, searchProjectsByName, appendPageContent } from "./notionWriter";
-import { fetchCurrentSprintTasksSummary, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems } from "./notionApi";
+import { fetchCurrentSprintTasksSummary, fetchSprintCapacity, fetchAllSprints, fetchReferenceDbItems, fetchPageTitles } from "./notionApi";
 import { fetchMembers } from "./memberApi";
 import {
   calculateAvgDailySpConsumption,
@@ -110,7 +110,8 @@ export async function executeTaskCreation(
     名前: { title: [{ text: { content: task.task_name } }] },
     期限: { date: { start: task.due } },
     SP: { number: task.sp },
-    ステータス: { status: { name: task.status } }
+    ステータス: { status: { name: task.status } },
+    カテゴリ: { select: { name: "タスク" } }
   };
 
   if (assigneeId) {
@@ -242,7 +243,8 @@ export async function executeNotionActions(
     task_name: string;
     new_value: string;
   }>,
-  dryRun: boolean
+  dryRun: boolean,
+  projectDbId?: string
 ): Promise<string[]> {
   const results: string[] = [];
 
@@ -303,7 +305,7 @@ export async function executeNotionActions(
         continue;
       }
       try {
-        const candidates = await searchProjectsByName(token, action.new_value);
+        const candidates = await searchProjectsByName(token, action.new_value, projectDbId);
         console.log(`update_project: search "${action.new_value}" → ${candidates.length} candidates: ${candidates.map(c => `${c.name}(${c.id.slice(0,8)})`).join(", ")}`);
         if (candidates.length === 0) {
           results.push(`・${action.task_name}: プロジェクト「${action.new_value}」が見つかりませんでした`);
@@ -316,6 +318,24 @@ export async function executeNotionActions(
       } catch (err) {
         console.error(`Failed to update project for ${action.page_id}:`, (err as Error).message);
         results.push(`・${action.task_name}: プロジェクト変更失敗 (${(err as Error).message})`);
+      }
+      continue;
+    }
+
+    // append_description — append text to task page content
+    if (action.action === "append_description") {
+      if (dryRun) {
+        console.log(`DRY_RUN: append_description ${action.task_name}`);
+        results.push(`（DRY_RUN）${action.task_name}: 説明文追記`);
+        continue;
+      }
+      try {
+        await appendPageContent(token, action.page_id, action.new_value);
+        const link = notionPageUrl(action.page_id);
+        results.push(`・<${link}|${action.task_name}>: 説明文を追記しました`);
+      } catch (err) {
+        console.error(`Failed to append description for ${action.page_id}`, (err as Error).message);
+        results.push(`・${action.task_name}: 説明文追記失敗 (${(err as Error).message})`);
       }
       continue;
     }
@@ -450,7 +470,7 @@ async function handleProjectSelectionReply(
   // Build confirmation message
   const task = pending.newTask;
   const responseText = [
-    "以下のタスクを追加します。問題なければ ✅ をリアクションしてください:",
+    "以下のタスクを追加します。問題なければ ✅ 承認ボタンを押してください:",
     `・タスク名: *${task.task_name}*`,
     `・担当: ${task.assignee}`,
     `・期限: ${task.due}`,
@@ -459,11 +479,15 @@ async function handleProjectSelectionReply(
     `📁 プロジェクト: *${selected.name}*`
   ].join("\n");
 
+  const projSelectBlocks = [
+    { type: "section", text: { type: "mrkdwn", text: `${userMention}${responseText}` } },
+    ...buildApprovalButtons("task_action")
+  ];
   const confirmMsg = await chatPostMessage(
     config.slackBotToken,
     channel,
     `${userMention}${responseText}`,
-    buildApprovalButtons("task_action"),
+    projSelectBlocks,
     threadTs
   );
 
@@ -834,6 +858,29 @@ async function handleMention(
 
     const result = await interpretMention(config, userText, summary, mentionContext, requestUserName, conversationHistory, pendingCreateTasks, pendingUpdateActions, trimmedThreadContext, trimmedChannelContext, trimmedReferenceItems);
 
+    // Guard: if pending create tasks exist but LLM returned intent="update",
+    // merge the update actions back into the pending create tasks.
+    // Tasks don't exist in Notion yet, so update actions would fail with invalid page_id.
+    if (pendingCreateTasks && pendingCreateTasks.length > 0 && result.intent === "update" && result.actions.length > 0) {
+      console.log(`Converting update intent to create_task modification (${result.actions.length} actions on ${pendingCreateTasks.length} pending tasks)`);
+      const actionMap: Record<string, string> = {};
+      for (const act of result.actions) {
+        actionMap[act.action] = act.new_value;
+      }
+      result.intent = "create_task";
+      result.new_tasks = pendingCreateTasks.map((t) => ({
+        task_name: t.task_name,
+        assignee: actionMap["update_assignee"] ?? t.assignee,
+        due: actionMap["update_due"] ?? t.due,
+        sp: actionMap["update_sp"] ? Number(actionMap["update_sp"]) : t.sp,
+        status: actionMap["update_status"] ?? t.status,
+        project: actionMap["update_project"] !== undefined ? actionMap["update_project"] : t.project,
+        description: t.description,
+        sprint: actionMap["update_sprint"] !== undefined ? actionMap["update_sprint"] : t.sprint
+      }));
+      result.actions = [];
+    }
+
     if (result.intent === "create_task" && result.new_tasks.length > 0) {
       // If modifying a pending create, clean up old pending action first
       if (pendingCreateRef) {
@@ -850,11 +897,16 @@ async function handleMention(
       for (let i = 0; i < result.new_tasks.length; i++) {
         const newTask = result.new_tasks[i];
         // Resolve project before sending confirmation
-        let resolvedProjectIds = summary.projectIds ?? [];
+        // project="" means explicitly no project; project=null means use default
+        let resolvedProjectIds: string[] = [];
         let projectDisplay: string | null = null;
 
-        if (newTask.project) {
-          const candidates = await searchProjectsByName(config.notionToken, newTask.project);
+        if (newTask.project === "") {
+          // User explicitly said "no project"
+          resolvedProjectIds = [];
+          projectDisplay = null;
+        } else if (newTask.project) {
+          const candidates = await searchProjectsByName(config.notionToken, newTask.project, config.projectDbId);
 
           if (candidates.length === 0) {
             resolvedProjectIds = [];
@@ -865,6 +917,17 @@ async function handleMention(
           } else {
             resolvedProjectIds = [candidates[0].id];
             projectDisplay = candidates[0].name;
+          }
+        } else {
+          // null — use default project from sprint (pick only the most common one)
+          const defaultIds = summary.projectIds ?? [];
+          resolvedProjectIds = defaultIds.length > 0 ? [defaultIds[0]] : [];
+          if (resolvedProjectIds.length > 0) {
+            const titleMap = await fetchPageTitles(config, resolvedProjectIds);
+            const firstName = titleMap.get(resolvedProjectIds[0]);
+            if (firstName) {
+              projectDisplay = firstName;
+            }
           }
         }
 
@@ -896,14 +959,31 @@ async function handleMention(
         if (newTask.sprint) {
           const sprintVal = newTask.sprint.trim();
           const normalize = (s: string) => s.trim().toLowerCase().replace(/[\s\u3000]+/g, "");
-          const matchedSprint = allSprints.find(
-            (s) =>
-              s.id === sprintVal ||
-              s.id.replace(/-/g, "") === sprintVal.replace(/-/g, "") ||
-              normalize(s.name) === normalize(sprintVal) ||
-              normalize(s.name).includes(normalize(sprintVal)) ||
-              normalize(sprintVal).includes(normalize(s.name))
-          );
+          // Match sprint: prefer exact match, then prefix/suffix boundary match (avoid "S1" matching "S10")
+          const nVal = normalize(sprintVal);
+          const matchedSprint =
+            allSprints.find(
+              (s) =>
+                s.id === sprintVal ||
+                s.id.replace(/-/g, "") === sprintVal.replace(/-/g, "") ||
+                normalize(s.name) === nVal
+            ) ??
+            allSprints.find((s) => {
+              const nName = normalize(s.name);
+              // Only allow substring match when the remaining part is NOT alphanumeric
+              // e.g. "s10" includes "s1" but the next char is "0" (digit) → reject
+              if (nName.includes(nVal)) {
+                const idx = nName.indexOf(nVal);
+                const after = nName[idx + nVal.length];
+                return !after || !/[a-z0-9]/.test(after);
+              }
+              if (nVal.includes(nName)) {
+                const idx = nVal.indexOf(nName);
+                const after = nVal[idx + nName.length];
+                return !after || !/[a-z0-9]/.test(after);
+              }
+              return false;
+            });
           if (matchedSprint) {
             resolvedSprintId = matchedSprint.id;
             sprintDisplay = matchedSprint.name;
@@ -927,10 +1007,11 @@ async function handleMention(
           `${label}・タスク名: *${newTask.task_name}*`,
           `・担当: ${newTask.assignee}`,
           `・期限: ${newTask.due}`,
-          `・SP: ${newTask.sp}`
+          `・SP: ${newTask.sp}`,
+          `・ステータス: ${newTask.status ?? "Backlog"}`
         ];
-        if (projectDisplay) lines.push(`・プロジェクト: *${projectDisplay}*`);
-        lines.push(`・スプリント: ${sprintDisplay ?? "バックログ"}`);
+        lines.push(`・プロジェクト: ${projectDisplay ? `*${projectDisplay}*` : "未設定"}`);
+        lines.push(`・スプリント: ${sprintDisplay ?? "未設定"}`);
         if (taskDescription) lines.push(`・📝 概要: ${taskDescription}`);
         taskBlocks.push(lines.join("\n"));
 
@@ -943,12 +1024,13 @@ async function handleMention(
             ...(resolvedSprintId ? { sprintId: resolvedSprintId } : {}),
             sprintName: newTask.sprint,
             projectIds: resolvedProjectIds,
-            ...(taskDescription ? { description: taskDescription } : {})
+            ...(taskDescription ? { description: taskDescription } : {}),
+            relevantUrls: result.relevant_urls ?? []
           })
         });
       }
 
-      const responseText = `以下のタスクを追加します。問題なければ ✅ をリアクションしてください:\n\n${taskBlocks.join("\n\n")}`;
+      const responseText = `以下のタスクを追加します。問題なければ ✅ 承認ボタンを押してください:\n\n${taskBlocks.join("\n\n")}`;
 
       if (needsDescriptionHearing) {
         // Single task with no description — ask user for description
@@ -974,11 +1056,17 @@ async function handleMention(
         console.log(`Asking for task description: "${result.new_tasks[0].task_name}", ts=${askMsg.ts}`);
       } else {
         // Has description or multiple tasks — send confirmation with buttons
+        const modifyHint = "_修正したい場合は、修正内容をこのスレッドに返信してください_";
+        const createBlocks = [
+          { type: "section", text: { type: "mrkdwn", text: `${userMention}${responseText}` } },
+          { type: "section", text: { type: "mrkdwn", text: modifyHint } },
+          ...buildApprovalButtons("task_action")
+        ];
         const confirmMsg = await chatPostMessage(
           config.slackBotToken,
           channel,
           `${userMention}${responseText}`,
-          buildApprovalButtons("task_action"),
+          createBlocks,
           threadTs
         );
 
@@ -1013,23 +1101,50 @@ async function handleMention(
       }
 
       // Resolve project names for update_project actions
-      let confirmText = result.response_text;
       for (const act of result.actions) {
         if (act.action === "update_project" && act.new_value) {
-          const candidates = await searchProjectsByName(config.notionToken, act.new_value);
+          const candidates = await searchProjectsByName(config.notionToken, act.new_value, config.projectDbId);
           if (candidates.length > 0 && candidates[0].name !== act.new_value) {
-            confirmText = confirmText.replaceAll(act.new_value, candidates[0].name);
             act.new_value = candidates[0].name;
           }
         }
       }
 
-      // Send confirmation message with buttons and save pending action
+      // Build structured confirmation text in code (same pattern as create_task)
+      const actionLabels: Record<string, string> = {
+        update_assignee: "担当者",
+        update_due: "期限",
+        update_sp: "SP",
+        update_status: "ステータス",
+        update_sprint: "スプリント",
+        update_project: "プロジェクト",
+        append_description: "説明文追記"
+      };
+      const updateLines: string[] = [];
+      for (const act of result.actions) {
+        const label = actionLabels[act.action] ?? act.action;
+        if (act.action === "append_description") {
+          // Show truncated description preview
+          const preview = act.new_value.length > 80 ? act.new_value.slice(0, 80) + "…" : act.new_value;
+          updateLines.push(`・「${act.task_name}」: ${label}\n  「${preview}」`);
+        } else {
+          updateLines.push(`・「${act.task_name}」: ${label} → ${act.new_value}`);
+        }
+      }
+      const updateResponseText = `以下の更新を実行します。問題なければ ✅ 承認ボタンを押してください:\n\n${updateLines.join("\n")}`;
+
+      // Send confirmation message with explicitly constructed blocks (same as create_task)
+      const updateModifyHint = "_修正したい場合は、修正内容をこのスレッドに返信してください_";
+      const updateBlocks = [
+        { type: "section", text: { type: "mrkdwn", text: `${userMention}${updateResponseText}` } },
+        { type: "section", text: { type: "mrkdwn", text: updateModifyHint } },
+        ...buildApprovalButtons("task_action")
+      ];
       const confirmMsg = await chatPostMessage(
         config.slackBotToken,
         channel,
-        `${userMention}${confirmText}`,
-        buildApprovalButtons("task_action"),
+        `${userMention}${updateResponseText}`,
+        updateBlocks,
         threadTs
       );
 
@@ -1215,185 +1330,7 @@ async function handleReactionAdded(
     return;
   }
 
-  // Only handle ✅ (white_check_mark) below
-  if (reaction !== "white_check_mark") return;
-
-  // Check if there's a pending Notion action for this message
-  const pending = await getPendingAction(env.NOTIFY_CACHE, channel, messageTs);
-  console.log(`Pending action lookup: ${pending ? `found ${pending.actions.length} actions` : "NOT FOUND"}`);
-  if (!pending) {
-    // Also check if this is a PM thread confirmation (Step 8)
-    const today = toJstDateString();
-    // Try channel-scoped PM thread first, then global (backward compat)
-    let pmThread = await getPmThread(env.NOTIFY_CACHE, today, channel);
-    let pmThreadScope: string | undefined = channel;
-    if (!pmThread) {
-      pmThread = await getPmThread(env.NOTIFY_CACHE, today);
-      pmThreadScope = undefined;
-    }
-    if (
-      pmThread &&
-      pmThread.state === "pending" &&
-      pmThread.channel === channel &&
-      pmThread.ts === messageTs
-    ) {
-      // PM reacted ✅ to the daily report — interpret as full approval
-      const proposal = JSON.parse(pmThread.proposalJson) as AllocationProposal;
-      const approvalText = "全提案を承認します";
-      const actions = await interpretPmReply(config, proposal, approvalText);
-
-      const results = await executeNotionActions(
-        config.notionToken,
-        actions.actions,
-        config.dryRun
-      );
-
-      // Save back to the SAME scope key we read from + mark the other scope too
-      await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, pmThreadScope);
-      if (pmThreadScope === undefined) {
-        await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
-      } else {
-        await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, undefined);
-      }
-
-      const summaryMsg =
-        results.length > 0
-          ? `✅ Notion更新完了\n\n更新内容:\n${results.join("\n")}`
-          : "✅ 更新する内容がありませんでした。";
-
-      await chatPostMessage(
-        config.slackBotToken,
-        channel,
-        summaryMsg,
-        undefined,
-        messageTs
-      );
-
-      // Step 9: Channel-wide completion notification
-      const pmoChannel = config.slackPmoChannelId;
-      if (pmoChannel) {
-        await sendCompletionNotification(
-          config.slackBotToken,
-          pmoChannel,
-          results,
-          config.dryRun
-        );
-      }
-    }
-    return;
-  }
-
-  // Check if this contains task creation actions
-  const createActions = pending.actions.filter((a) => a.action === "create_task");
-  if (createActions.length > 0) {
-    // Pre-fetch user maps once (avoids repeated API calls per task)
-    const dbUserMap = config.taskDbId
-      ? await buildUserMapFromDatabase(config.notionToken, config.taskDbId)
-      : new Map<string, string>();
-    const notionUserMap = await fetchNotionUserMap(config.notionToken);
-    const userMaps = { dbUserMap, notionUserMap };
-
-    // Create all tasks in parallel
-    const taskResults = await Promise.all(
-      createActions.map(async (createAction) => {
-        const newTask = JSON.parse(createAction.new_value) as NewTask & { sprintId?: string; projectIds?: string[]; project?: string | null; description?: string };
-        const result = await executeTaskCreation(
-          {
-            notionToken: config.notionToken,
-            taskDbId: config.taskDbId,
-            taskSprintRelationProperty: config.taskSprintRelationProperty,
-            dryRun: config.dryRun
-          },
-          newTask,
-          userMaps
-        );
-
-        // Append description as page content if available
-        if (result.pageId && newTask.description) {
-          try {
-            await appendPageContent(config.notionToken, result.pageId, newTask.description);
-            console.log(`Description appended to page ${result.pageId}`);
-          } catch (err) {
-            console.warn(`Failed to append description: ${(err as Error).message}`);
-          }
-        }
-
-        console.log(`Task creation executed: "${newTask.task_name}"`);
-        return { result, newTask };
-      })
-    );
-
-    const allResults = taskResults.map((r) => r.result.message);
-    const notificationLines = taskResults.map(
-      (r) => `・タスク追加: ${r.newTask.task_name}（担当: ${r.newTask.assignee}、期限: ${r.newTask.due}、SP: ${r.newTask.sp}）`
-    );
-
-    await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
-    // Clean up thread-level reference to prevent stale lookups
-    if (pending.threadTs) {
-      await deletePendingCreateRef(env.NOTIFY_CACHE, channel, pending.threadTs);
-    }
-
-    await chatPostMessage(
-      config.slackBotToken,
-      channel,
-      allResults.join("\n\n"),
-      undefined,
-      messageTs
-    );
-
-    // Step 9: Channel-wide completion notification
-    const pmoChannelForCreate = config.slackPmoChannelId;
-    if (pmoChannelForCreate && !config.dryRun) {
-      await sendCompletionNotification(
-        config.slackBotToken,
-        pmoChannelForCreate,
-        notificationLines,
-        false
-      );
-    }
-
-    return;
-  }
-
-  // Execute the pending Notion update actions
-  const results = await executeNotionActions(
-    config.notionToken,
-    pending.actions,
-    config.dryRun
-  );
-
-  await deletePendingAction(env.NOTIFY_CACHE, channel, messageTs);
-  // Clean up thread-level reference to prevent stale lookups
-  if (pending.threadTs) {
-    await deletePendingCreateRef(env.NOTIFY_CACHE, channel, pending.threadTs);
-  }
-
-  const summaryMsg =
-    results.length > 0
-      ? `✅ Notion更新完了\n\n更新内容:\n${results.join("\n")}`
-      : "✅ 更新する内容がありませんでした。";
-
-  await chatPostMessage(
-    config.slackBotToken,
-    channel,
-    summaryMsg,
-    undefined,
-    messageTs
-  );
-
-  // Step 9: Channel-wide completion notification
-  const pmoChannelForUpdate = config.slackPmoChannelId;
-  if (pmoChannelForUpdate) {
-    await sendCompletionNotification(
-      config.slackBotToken,
-      pmoChannelForUpdate,
-      results,
-      config.dryRun
-    );
-  }
-
-  console.log(`Executed ${pending.actions.length} Notion actions from reaction_added`);
+  // ✅ stamp approval has been deprecated — only ☎️ phone reaction is handled
 }
 
 // ── Handle assignee thread replies (message event in tracked thread) ───────
@@ -1402,6 +1339,9 @@ async function handleAssigneeReply(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
+  // Skip bot messages (defensive: Slack may omit bot_id in edge cases)
+  if (event.bot_id || event.bot_profile || !event.user) return;
+
   const channel = event.channel as string;
   const config = await resolveConfig(env, channel);
   if (!config.slackBotToken) return;
@@ -1481,6 +1421,9 @@ async function handlePmReply(
   env: Bindings,
   event: Record<string, unknown>
 ): Promise<void> {
+  // Skip bot messages (defensive: Slack may omit bot_id in edge cases)
+  if (event.bot_id || event.bot_profile || !event.user) return;
+
   const channel = event.channel as string;
   const config = await resolveConfig(env, channel);
   if (!config.slackBotToken) return;
@@ -1517,14 +1460,20 @@ async function handlePmReply(
       .join("\n");
     const confirmText =
       actions.actions.length > 0
-        ? `以下の更新を実行します。問題なければ ✅ をリアクションしてください:\n\n${actionLines}`
+        ? `以下の更新を実行します。問題なければ ✅ 承認ボタンを押してください:\n\n${actionLines}`
         : "更新する内容が見当たりませんでした。もう少し具体的に教えてください。";
 
+    const pmConfirmBlocks = actions.actions.length > 0
+      ? [
+          { type: "section", text: { type: "mrkdwn", text: confirmText } },
+          ...buildApprovalButtons("task_action")
+        ]
+      : undefined;
     const confirmMsg = await chatPostMessage(
       config.slackBotToken,
       channel,
       confirmText,
-      actions.actions.length > 0 ? buildApprovalButtons("task_action") : undefined,
+      pmConfirmBlocks,
       threadTs
     );
 
@@ -1538,6 +1487,7 @@ async function handlePmReply(
     }
 
     // Save back to the SAME scope key we read from + mark the other scope too
+    console.log(`[PM-PROCESSED-BY] handlePmReply (thread reply), scope=${pmThreadScope}, channel=${channel}, threadTs=${threadTs}, text="${text.slice(0, 50)}"`)
     await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, pmThreadScope);
     if (pmThreadScope === undefined) {
       await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" }, undefined, channel);
@@ -1670,7 +1620,10 @@ export async function handleSlackEvents(
   }
 
   // ── message (thread replies only, not from bots) ────────────────────────
-  if (eventType === "message" && !botId && !subtype) {
+  // Also filter by event.user: Slack may deliver bot messages without bot_id in edge cases
+  const eventUserId = event.user as string | undefined;
+  const isSelfMessage = botUserId ? eventUserId === botUserId : false;
+  if (eventType === "message" && !botId && !subtype && !isSelfMessage) {
     const threadTs = event.thread_ts as string | undefined;
     const channel = event.channel as string | undefined;
 

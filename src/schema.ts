@@ -384,7 +384,7 @@ export const mentionIntentSchema = z.object({
   response_text: z.string(),
   actions: z.array(
     z.object({
-      action: z.enum(["update_assignee", "update_due", "update_sp", "update_status", "update_sprint", "update_project"]),
+      action: z.enum(["update_assignee", "update_due", "update_sp", "update_status", "update_sprint", "update_project", "append_description"]),
       page_id: z.string(),
       task_name: z.string(),
       new_value: z.string()
@@ -401,7 +401,8 @@ export const mentionIntentSchema = z.object({
       description: z.string().nullable(),
       sprint: z.string().nullable()
     })
-  )
+  ),
+  relevant_urls: z.array(z.string()).default([])
 });
 export type MentionIntent = z.infer<typeof mentionIntentSchema>;
 
@@ -422,7 +423,7 @@ export const mentionIntentJsonSchema = {
           properties: {
             action: {
               type: "string",
-              enum: ["update_assignee", "update_due", "update_sp", "update_status", "update_sprint", "update_project"]
+              enum: ["update_assignee", "update_due", "update_sp", "update_status", "update_sprint", "update_project", "append_description"]
             },
             page_id: { type: "string" },
             task_name: { type: "string" },
@@ -448,9 +449,13 @@ export const mentionIntentJsonSchema = {
           },
           required: ["task_name", "assignee", "due", "sp", "status", "project", "description", "sprint"]
         }
+      },
+      relevant_urls: {
+        type: "array",
+        items: { type: "string" }
       }
     },
-    required: ["intent", "response_text", "actions", "new_tasks"]
+    required: ["intent", "response_text", "actions", "new_tasks", "relevant_urls"]
   }
 };
 

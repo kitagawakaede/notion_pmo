@@ -568,10 +568,7 @@ export async function interpretMention(
 - 「自分」「私」「俺」等の一人称は、request_user（発言者）を指す。request_user.nameの担当タスクで回答すること
 
 **update（更新指示）**: Notionのタスク更新リクエスト
-- response_textに確認メッセージを生成。**必ず以下の形式でマッチしたタスクの詳細を含めること**:
-  対象タスク: 「{タスク名}」（担当: {担当者}、現在のステータス: {status}、期限: {due}、SP: {sp}）
-  変更内容: {変更項目} {現在の値} → {新しい値}
-  問題なければ ✅ をリアクションしてください
+- response_textには簡潔な確認メッセージのみ生成（例: 「SPを5に変更します」）。確認UIはシステムが自動生成するため、対象タスクの詳細や承認指示は不要
 - actionsに実行するNotion更新アクションを配列で返す。変更対象の項目のみ含める（変更しない項目のアクションは不要）
 - page_idはタスクリストに含まれるIDを必ず使用する（存在しないIDは使わない）
 - ユーザーの指示が曖昧で複数タスクに該当しうる場合は、候補を列挙してどのタスクか確認する（intent="query"、actionsは空）
@@ -580,20 +577,25 @@ export async function interpretMention(
 **update_sprint（スプリント移動）**: タスクを別スプリントに移動、またはバックログに戻す
 - action = "update_sprint"
 - new_valueにはavailable_sprintsのIDを使用する。バックログ戻しの場合はnew_value = ""（空文字）
-- response_textに確認メッセージを生成（対象タスクの詳細 + 移動先スプリント名を明記）
 - intent = "update"（updateとして扱う）
 
 **update_project（プロジェクト変更）**: タスクのプロジェクトリレーションを変更
 - action = "update_project"
 - new_valueにはプロジェクト名（日本語）を使用する（例: "三井住友海上"）
-- response_textに確認メッセージを生成（対象タスクの詳細 + 変更先プロジェクト名を明記）
+- intent = "update"（updateとして扱う）
+
+**append_description（説明文追記）**: 既存タスクのページ本文にテキストを追記する
+- action = "append_description"
+- new_valueには追記するテキスト内容をそのままセットする（ユーザーの指定テキストをそのまま使う）
+- page_idは対象タスクのIDを使用する
+- 「概要を追加」「説明文を追記」「以下の内容を追加して」等のリクエストに使用する
 - intent = "update"（updateとして扱う）
 
 **create_task（タスク追加）**: 新しいタスクをNotionに追加するリクエスト
 - 必須項目: task_name（タスク名）、assignee（担当者名）、due（期限 YYYY-MM-DD）、sp（SP）
-- オプション項目: project（プロジェクト名）- ユーザーが指定した場合のみセット、未指定ならnull
+- オプション項目: project（プロジェクト名）- ユーザーが指定した場合のみセット。未指定ならnull（チャンネルのデフォルトプロジェクトが使われる）。「プロジェクトはなし」「プロジェクトなしで」等と明示的にプロジェクトを外す指示があった場合は空文字""をセット
 - オプション項目: description（概要）- システムが自動生成した概要。ユーザーが修正を依頼した場合のみ変更する
-- オプション項目: sprint（スプリント名）- available_sprintsに含まれるスプリント名を指定する。ユーザーが「スプリントに入れて」「現スプリントに追加」等と指定した場合にセットする。未指定またはユーザーが「スプリントはまだ設定しないで」「バックログにして」等と指示した場合はnull（バックログとして起票される）。デフォルトはnull
+- オプション項目: sprint（スプリント名）- available_sprintsに含まれるスプリント名を指定する。ユーザーが「スプリントに入れて」「現スプリントに追加」等と指定した場合にセットする。未指定またはユーザーが「スプリントはまだ設定しないで」等と指示した場合はnull。⚠️「バックログ」はステータスの値であってスプリント名ではない — sprintに"バックログ"を入れないこと。デフォルトはnull
 - 複数タスクの同時作成に対応: スレッド内容から複数のタスクが識別できる場合、new_tasksに複数のタスクを含める
 - ⚠️ タスク情報の出典ルール（厳守）:
   - task_nameはuser_message、thread_context、channel_context、current_tasksのいずれかに根拠があること
@@ -601,7 +603,7 @@ export async function interpretMention(
   - どこにも存在しないタスク名を捏造してはならない
 - 全ての必須項目が揃っている場合:
   - intent = "create_task"
-  - response_textに確認メッセージを生成（全タスクの詳細を一覧表示 + 「✅ をリアクションしてください」）
+  - response_textに確認メッセージを生成（全タスクの詳細を一覧表示 + 「✅ 承認ボタンを押してください」）
   - response_textに📝概要は含めない（システム側で別途表示する）
   - new_tasksに作成するタスク情報を配列でセット、各タスクのstatusはユーザーが指定しない限り "Backlog"
   - descriptionは新規作成時はnull（システムが後から自動生成する）。thread_contextがある場合はスレッド内容からタスクの目的・背景・やるべきことだけを抽出して200字以内の概要をセット（「起票して」「担当を変更」「SPを○に」等のBot操作指示や、担当者名・期限・SP等のメタ情報は概要に含めない）
@@ -618,24 +620,35 @@ export async function interpretMention(
 
 ■ 保留中のタスク作成の修正:
 - pending_create_tasksが提供されている場合、ユーザーは確認待ちのタスク作成に対する修正を依頼している可能性が高い
-- プロジェクト変更、担当者変更、期限変更、SP変更、スプリント変更など、修正内容を特定できたら:
+- プロジェクト変更、担当者変更、期限変更、SP変更、ステータス変更、スプリント変更など、修正内容を特定できたら:
   - intent="create_task"で、pending_create_tasksをベースに変更点を反映したnew_tasksを返す
-  - response_textに修正後のタスク詳細と「✅をリアクションしてください」を含める（📝概要はresponse_textに含めない）
+  - response_textに修正後のタスク詳細と「✅ 承認ボタンを押してください」を含める（📝概要はresponse_textに含めない）
   - actionsは空配列 []
 - 概要（description）の修正:
   - 「概要を○○にして」「概要修正: ○○」→ 該当タスクのdescriptionに修正後のテキストをセット
   - 「概要なし」「概要を削除」「スキップ」→ descriptionをnullにセット
   - 概要に言及していない修正の場合 → pending_create_tasksのdescriptionをそのまま引き継ぐ
+- ステータス（status）の修正:
+  - 「ステータスはreadyで」「readyにして」→ statusを"Ready"にセット
+  - 「doingにして」→ statusを"Doing"にセット
+  - その他の有効なステータス値: "Backlog", "Ready", "Doing", "Review", "Done"
+  - ステータスに言及していない修正の場合 → pending_create_tasksのstatusをそのまま引き継ぐ
+- プロジェクト（project）の修正:
+  - 「プロジェクトはなし」「プロジェクト外して」「プロジェクトなしで」→ projectを""（空文字）にセット
+  - 「プロジェクトは○○」「プロジェクトを○○にして」→ projectに○○の部分だけをセット（「タスク作成」「変更」等の操作名を含めない。例: 「プロジェクトを明安にして」→ project="明安"）
+  - プロジェクトに言及していない修正の場合 → pending_create_tasksのprojectをそのまま引き継ぐ
 - スプリント（sprint）の修正:
   - 「スプリントに入れて」「現スプリントに追加」→ available_sprintsから該当スプリント名をsprintにセット
-  - 「スプリントはまだ設定しないで」「バックログにして」「スプリント外して」→ sprintをnullにセット
+  - 「スプリントはS10で」「s10でお願い」→ available_sprintsから名前が一致するスプリントを探し、そのスプリント名をsprintにセット（ユーザーの指定した名前を正確に使うこと。「S10」と「S1」は別物）
+  - 「スプリントはまだ設定しないで」「スプリント外して」→ sprintをnullにセット（⚠️「バックログ」はステータスの値でありスプリント名ではない — sprintに"バックログ"を入れないこと）
   - スプリントに言及していない修正の場合 → pending_create_tasksのsprintをそのまま引き継ぐ
 - 概要のヒアリング（pending_create_tasksのdescriptionがnullの場合）:
   - ユーザーがタスクの背景・目的・詳細を説明するテキストを返信した場合:
     → その内容を200字以内で簡潔にまとめてdescriptionにセット
     → intent="create_task"で、pending_create_tasksをベースにdescriptionを追加したnew_tasksを返す
-    → response_textに確認メッセージ + 「✅をリアクションしてください」を含める
-- 重要: pending_create_tasksがある場合、updateアクション（update_assignee, update_due等）に変換しないこと。タスクはまだNotionに存在しないため、既存タスクの更新はできない
+    → response_textに確認メッセージ + 「✅ 承認ボタンを押してください」を含める
+- 重要: pending_create_tasksがある場合、intent="update"やupdateアクション（update_assignee, update_due等）に変換しないこと。必ずintent="create_task"で返すこと。タスクはまだNotionに存在しないため、既存タスクの更新はできない
+- 重要: projectやsprintの値にはユーザーが指定した名前のみをセットすること。「タスク作成」「変更」「更新」等の操作を説明する語句を混入させないこと
 
 ■ 保留中の更新アクションの修正:
 - pending_update_actionsが提供されている場合、確認待ちの更新アクションが存在する
@@ -643,8 +656,7 @@ export async function interpretMention(
 - ユーザーが「担当を○○に変更」等と言った場合: current_tasksの現在の値から○○への変更としてactionsを作る（pending_update_actionsのnew_valueを現在値として扱わない）
 - ユーザーが追加の変更を依頼した場合: pending_update_actionsを破棄し、ユーザーの新しい指示に基づいてactionsを作り直す
 - ユーザーがキャンセルを依頼した場合: intent="unknown"でキャンセル確認メッセージを返す
-- intent="update"で、修正後の全アクションをactionsに含め、response_textに更新内容一覧と「✅をリアクションしてください」を含める
-- response_textの「現在の担当者」等はcurrent_tasksの実際の値を使うこと
+- intent="update"で、修正後の全アクションをactionsに含める（確認UIはシステムが自動生成する）
 
 ■ スレッドからのタスク自動起票:
 - thread_contextが提供されている場合、ユーザーはスレッド内の会話をもとにタスクを作成したいと考えている
@@ -679,7 +691,8 @@ export async function interpretMention(
   - due: 議論内容に期限の言及があればそれを使用。なければスプリント終了日を使う
   - sp: タスクの複雑さ・規模から推測（1〜5程度）。分解した場合は各タスクごとに適切なSPを設定
   - description: スレッドの議論内容 + channel_contextやcurrent_tasksから見つけた関連情報を組み合わせて、背景・目的・やるべきことを200字以内で具体的に要約する
-  - project: スレッド内にプロジェクト名の言及があればセット。なければchannel_contextやcurrent_tasksから関連プロジェクトを推測してセット。それでも不明ならnull
+  - project: ユーザーが「プロジェクトはなし」「プロジェクトなし」と明示した場合→ ""（空文字）。プロジェクト名を指定した場合→ その名前のみセット。言及がなければchannel_contextやcurrent_tasksから関連プロジェクトを推測してセット。それでも不明ならnull
+  - sprint: ユーザーが「スプリントはS10で」等と明示した場合→ available_sprintsから該当するスプリント名をセット。「スプリントはなし」「バックログで」→ null。スプリントに言及していない場合→ null（勝手に推測しない）
   - assignee（担当者）: PMに確認を取る。以下の手順に従う:
     1. スレッド内で「○○さんお願い」「@○○」等の明示的な指名がある場合 → その人をassigneeにセットし、通常通り確認メッセージを送る
     2. 明示的な指名がない場合 → channel_context（チャンネル全体の発言）とcurrent_tasks（Notionの既存タスク）を分析し、そのタスクのテーマに最も知見がありそうなメンバーを候補として提案する。ただしassigneeは確定せず、PMに確認を取る
@@ -706,6 +719,13 @@ export async function interpretMention(
 - 重要な数値は *太字* にする
 - 箇条書きは ・ を使用（ハイフン - ではなく中黒 ・）
 - 全体を簡潔に保つ
+
+■ 関連URLの抽出（relevant_urls）:
+- intent が "create_task" の場合、thread_context および channel_context 内のメッセージに含まれるURLを分析する
+- タスクの内容に関連するURLのみを relevant_urls に含める（設計書、仕様書、参考資料、関連ページなど）
+- 関連性の判断基準: タスクの背景・目的・実装に直接関わるURLを優先する
+- Bot操作指示のみのメッセージに含まれるURL、Slack内部リンク（slack.com）、明らかに無関係なURLは除外する
+- create_task 以外の intent では空配列 [] を返す
 
 タスクリストに存在しないタスクへの更新指示の場合は、その旨をresponse_textに記載しintentをunknownにしてください。
 担当者変更の場合のnew_valueは担当者名（日本語）を使用してください。

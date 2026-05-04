@@ -1196,6 +1196,7 @@ async function runEveningFlow(
     );
 
     // Save PM thread so Events API can route PM's reply (Step 8)
+    console.log(`[PM-SAVED-PENDING] evening flow, scope=${channelId}, channel=${pmResult.channel}, ts=${pmResult.ts}`);
     await savePmThread(env.NOTIFY_CACHE, today, {
       channel: pmResult.channel,
       ts: pmResult.ts,
@@ -1622,6 +1623,7 @@ async function handleHttp(request: Request, env: Env, ctx?: ExecutionContext): P
     if (!pmThread) {
       return jsonResponse({ ok: false, message: "no pm thread for today" });
     }
+    console.log(`[PM-PROCESSED-BY] /pmo/pm-dismiss endpoint`);
     await savePmThread(env.NOTIFY_CACHE, today, { ...pmThread, state: "processed" });
     return jsonResponse({ ok: true, message: "pm thread marked as processed" });
   }

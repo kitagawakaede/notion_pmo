@@ -210,4 +210,3 @@ __marimo__/
 node_modules
 .dev.vars
 .wrangler/
-readme.md
